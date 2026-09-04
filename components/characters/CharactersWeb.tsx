@@ -979,8 +979,15 @@ export default function CharactersWeb({
         );
       }
 
-      /* 2 — node drift + anti-collision (positions feed BOTH nodes and strings) */
-      const amp = reduceRef.current ? 0 : DRIFT_AMP;
+      /* 2 — node drift + anti-collision (positions feed BOTH nodes and strings).
+         While the canvas is being panned the whole world translates under the
+         finger — 3.5px per-node drift is imperceptible there, but recomputing
+         drifted positions + every edge path each frame is the dominant mobile
+         pan cost (measured: 4× throttle, 390px viewport). Freezing drift
+         during pan makes pan frames a single camera-transform write. */
+      const panFrozen = panRef.current !== null && dragNodeRef.current === null;
+      const amp =
+        reduceRef.current || panFrozen ? 0 : DRIFT_AMP;
       const { base, curX, curY } = geom;
       const dragIdx = dragNodeRef.current?.index ?? -1;
 
@@ -1685,7 +1692,10 @@ export default function CharactersWeb({
           ))}
         </g>
 
-        {/* World layer — transform written by the rAF loop, never by CSS */}
+        {/* World layer — transform written by the rAF loop, never by CSS.
+            NOTE: do NOT add will-change/layer promotion here — SVG groups are
+            re-rasterized wholesale when promoted, which made pan FPS worse
+            (measured). Pan smoothness comes from freezing drift below. */}
         <g ref={worldRef} style={{ transformOrigin: "0px 0px" }}>
           <g>
             {/* Strings — `d` is owned by the rAF loop; React owns paint + state.

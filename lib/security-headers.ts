@@ -18,10 +18,19 @@ export function buildCsp(nonce: string): string {
   const httpOrigin = SUPABASE_HOST ? `https://${SUPABASE_HOST}` : ""
   const wsOrigin = SUPABASE_HOST ? `wss://${SUPABASE_HOST}` : ""
 
+  // Dev relaxes script-src: Next's dev runtime injects unnonced inline
+  // scripts (React Refresh, HMR bootstrap) that a nonce policy blocks —
+  // and a blocked inline runtime cascades into blocked lazy chunks.
+  // 'unsafe-inline' is meaningless next to a nonce anyway (the spec ignores
+  // it when a nonce is present), so dev drops the nonce entirely.
+  // Production keeps the strict nonce + strict-dynamic policy unchanged.
+  const scriptSrc = isDev
+    ? `script-src 'self' 'unsafe-inline' 'unsafe-eval'`
+    : `script-src 'self' 'nonce-${nonce}' 'strict-dynamic'`
+
   const directives = [
     `default-src 'self'`,
-    // 'unsafe-eval' is required by React Fast Refresh in dev only.
-    `script-src 'self' 'nonce-${nonce}' 'strict-dynamic' ${isDev ? "'unsafe-eval'" : ""}`,
+    scriptSrc,
     `style-src 'self' 'unsafe-inline'`,
     `img-src 'self' data: blob: https: ${httpOrigin}`,
     `font-src 'self' data:`,

@@ -3492,6 +3492,12 @@ describe("POST /api/ai-chat", () => {
           new ReadableStream({
             start(controller) {
               controller.enqueue(encoder.encode(sse("The victim was")))
+            },
+            // The error must come from pull(), not start(): erroring a stream
+            // resets its queue, so enqueue-then-error in the same callback
+            // discards the chunk and the route correctly sees an empty
+            // response instead of a partial one.
+            pull(controller) {
               controller.error(new Error("connection reset"))
             },
           }),

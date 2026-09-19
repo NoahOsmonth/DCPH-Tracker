@@ -86,6 +86,7 @@ interface FakePersistence {
   conversationId: string
   window: ReturnType<typeof vi.fn>
   memories: ReturnType<typeof vi.fn>
+  recallAnswer: ReturnType<typeof vi.fn>
   record: ReturnType<typeof vi.fn>
   afterTurn: ReturnType<typeof vi.fn>
 }
@@ -97,6 +98,9 @@ function fakePersistence(overrides: Partial<FakePersistence> = {}): FakePersiste
     // history exactly as it does today.
     window: vi.fn(async () => ({ summary: null, turns: [] })),
     memories: vi.fn(async () => ""),
+    // "" is the seam's "nothing to say" (AI_MEMORY off), which the route reads
+    // as "fall through" rather than as an answer.
+    recallAnswer: vi.fn(async () => ""),
     record: vi.fn(async () => {}),
     afterTurn: vi.fn(async () => {}),
     ...overrides,
@@ -403,5 +407,92 @@ describe("POST /api/ai-chat with server-owned transcripts", () => {
     expect(messages.some((m) => m.content === "server turn")).toBe(true)
     expect(messages.some((m) => m.content === "client turn")).toBe(false)
     expect(messages[0]?.content).toContain("They discussed episode 5.")
+  })
+})
+
+/**
+ * Rule 6: a question about what the bot remembers of the user is answered from
+ * the memory table, without a model call — and a tracker question that merely
+ * sounds like one is not.
+ */
+describe("POST /api/ai-chat with a memory question", () => {
+  const RECALL_ANSWER =
+    "Here is what I remember about you:\n\nPreferences\n- favorite_character: Haibara (confidence 0.90)"
+
+  it("answers it from the seam, in the plain-text response shape, with no model call", async () => {
+    persistence.recallAnswer.mockResolvedValue(RECALL_ANSWER)
+    const fetchMock = vi.fn(async () => providerResponse(sse("Hi")))
+    vi.stubGlobal("fetch", fetchMock)
+    const { POST } = await import("@/app/api/ai-chat/route")
+
+    const response = await POST(post({ message: "what do you remember about me" }))
+    const text = await readText(response)
+
+    expect(response.status).toBe(200)
+    expect(response.headers.get("Content-Type")).toBe("text/plain; charset=utf-8")
+    expect(response.headers.get("Cache-Control")).toBe("no-cache, no-store, no-transform")
+    expect(persistence.recallAnswer).toHaveBeenCalled()
+    expect(text).toContain("Haibara")
+    // The whole point of the branch: a listing is data, not generation.
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it("leaves a domain question to retrieval and the gateway", async () => {
+    persistence.recallAnswer.mockResolvedValue(RECALL_ANSWER)
+    const fetchMock = vi.fn(async () => providerResponse(sse("Episode 5 is")))
+    vi.stubGlobal("fetch", fetchMock)
+    const { POST } = await import("@/app/api/ai-chat/route")
+
+    const text = await readText(await POST(post({ message: "what do you remember about episode 5" })))
+
+    expect(text).toBe("Episode 5 is")
+    expect(persistence.recallAnswer).not.toHaveBeenCalled()
+    expect(fetchMock).toHaveBeenCalled()
+  })
+
+  it("falls through to the model when the memory read exceeds 400 ms", async () => {
+    vi.useFakeTimers()
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {})
+    persistence.recallAnswer.mockReturnValue(new Promise(() => {}))
+    const fetchMock = vi.fn(async () => providerResponse(sse("Hi there")))
+    vi.stubGlobal("fetch", fetchMock)
+    const { POST } = await import("@/app/api/ai-chat/route")
+
+    const pending = POST(
+      post({
+        message: "what do you remember about me",
+        // An in-domain earlier turn, so the fall-through is decided by the
+        // branch rather than by the retrieval gate's own refusal.
+        history: [{ role: "user", content: "Who is Haibara?" }],
+      })
+    )
+    await vi.advanceTimersByTimeAsync(400)
+    const response = await pending
+
+    expect(await readText(response)).toBe("Hi there")
+    expect(fetchMock).toHaveBeenCalled()
+    expect(spy.mock.calls[0]?.[0]).toContain("[ai-chat]")
+    spy.mockRestore()
+  })
+
+  it("falls through when the seam has nothing to say", async () => {
+    // AI_MEMORY=off reaches the route as "", and an empty 200 would read as a
+    // broken answer rather than as "memory is off".
+    persistence.recallAnswer.mockResolvedValue("")
+    const fetchMock = vi.fn(async () => providerResponse(sse("Hi there")))
+    vi.stubGlobal("fetch", fetchMock)
+    const { POST } = await import("@/app/api/ai-chat/route")
+
+    const text = await readText(
+      await POST(
+        post({
+          message: "what do you remember about me",
+          history: [{ role: "user", content: "Who is Haibara?" }],
+        })
+      )
+    )
+
+    expect(text).toBe("Hi there")
+    expect(fetchMock).toHaveBeenCalled()
   })
 })

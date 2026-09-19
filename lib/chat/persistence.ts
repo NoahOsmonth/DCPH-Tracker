@@ -4,7 +4,7 @@
  *
  * The route must not know PostgREST, and it must not be modified every time the
  * schema moves. So this module builds the admin client, the two adapters and the
- * two stores, and hands the route a facade of four calls and one id — which also
+ * two stores, and hands the route a facade of five calls and one id — which also
  * means one line in a route test neutralises persistence completely (rule 7: the
  * existing integration test mocks this module, not the database).
  *
@@ -36,6 +36,7 @@ import {
   type MemoryClient,
 } from "@/lib/ai/memory/supabase-port"
 import { createMemoryStore } from "@/lib/ai/memory/store"
+import { renderMemoryAnswer } from "@/lib/ai/memory/recall"
 import { renderMemoryBlock, selectMemories } from "@/lib/ai/memory/score"
 import { createMemoryWriter, type MemoryWriter } from "@/lib/ai/memory/write"
 import { toStructuredCall } from "@/lib/ai/structured-call"
@@ -76,6 +77,12 @@ export interface RequestPersistence {
   window(): Promise<PersistedWindow | null>
   /** The rendered `[MEM]` block; "" when memory is off, empty, or unreadable. */
   memories(query: string): Promise<string>
+  /**
+   * The plain-text answer to a "what do you remember about me" question; ""
+   * when memory is off. The route reads "" as "no answer here" and falls
+   * through to the normal pipeline rather than sending an empty body.
+   */
+  recallAnswer(): Promise<string>
   /** The user turn. Rejects on a store failure; the route contains it. */
   record(role: "user" | "assistant", content: string): Promise<void>
   /**
@@ -210,6 +217,17 @@ export async function createRequestPersistence(
       // One clock reading for the whole ranking, so two facts cannot be aged
       // against different instants.
       return renderMemoryBlock(selectMemories(facts, query, { now: now() }))
+    },
+
+    async recallAnswer() {
+      // Before the read, not after, for the same reason `memories` is: the
+      // switch exists to stop the database work, not just its result (D6).
+      if (!memoryEnabled) return ""
+      // `loadActive` rather than the transparency `list`: an expired progress
+      // fact is not something to claim we remember, and this is the same read
+      // the prompt path already trusts.
+      const facts = await memoryStore.loadActive(userId)
+      return renderMemoryAnswer(facts)
     },
 
     async record(role, content) {

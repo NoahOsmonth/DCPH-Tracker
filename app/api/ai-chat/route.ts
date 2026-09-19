@@ -10,6 +10,7 @@ import {
 } from "@/lib/chat/intent"
 import { buildProviderTargets } from "@/lib/ai/targets"
 import { createGateway } from "@/lib/ai/gateway"
+import { isMemoryRecallQuestion } from "@/lib/ai/memory/recall"
 import { logRequest } from "@/lib/ai/request-log"
 import { rateLimitPersistent } from "@/lib/rate-limit-db"
 import {
@@ -86,6 +87,11 @@ function jsonError(message: string, status: number, extraHeaders?: HeadersInit) 
   })
 }
 
+/**
+ * The route's plain-text 200: a refusal, and now a memory answer. Both are
+ * complete answers the route already has in hand, so neither streams and both
+ * carry the same no-cache headers.
+ */
 function refusalResponse(reply: string): Response {
   return new Response(reply, {
     status: 200,
@@ -222,6 +228,23 @@ export async function POST(request: Request) {
     console.error("[ai-chat] transcript unavailable, using the client's history", error)
   }
   const activePersistence = persistence
+
+  // Rule 6: a question about what the bot remembers OF THE USER is answered
+  // from the memory table rather than by the model, because a listing is data,
+  // not generation. The matcher is narrow by construction -- it rejects any
+  // question naming a tracker noun -- so "what do you remember about episode 5"
+  // still reaches retrieval, and the read is bounded like every other pre-stream
+  // read: a slow database means the normal pipeline, never a stalled response.
+  if (activePersistence !== null && isMemoryRecallQuestion(userMessage)) {
+    try {
+      const answer = await withTimeout(activePersistence.recallAnswer(), PERSISTENCE_TIMEOUT_MS)
+      // "" is the seam's "memory is off". An empty body would read as a broken
+      // answer, so the turn goes to the model instead.
+      if (answer !== "") return refusalResponse(answer)
+    } catch (error) {
+      console.error("[ai-chat] memory recall unavailable, using the normal pipeline", error)
+    }
+  }
 
   let windowTurns: PersistedTurn[] | null = null
   let conversationSummary: string | undefined

@@ -415,9 +415,8 @@ function screeningReport(screening: Screening): ScreeningReport {
  *
  * v1 ranked its rows with `scoreEntry`, but that rank never left the query, so
  * every converted document is rankless (`rrf: 0`, `score: 0`) like a wiki
- * extract: the input order — v1's own relevance order — decides the numbering,
- * and the assembler's total order takes over only if the budget forces an
- * eviction.
+ * extract: the input order — v1's own relevance order — decides the numbering
+ * and the eviction order, and the assembler reads nothing else.
  */
 async function legacyEvidence(
   query: string,

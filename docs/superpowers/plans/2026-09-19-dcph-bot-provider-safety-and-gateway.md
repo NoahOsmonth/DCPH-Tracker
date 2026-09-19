@@ -663,7 +663,7 @@ describe("recordFailure", () => {
       initialTargetState("groq:x"),
       { kind: "server_error", cooldownMs: 1_000, retryNext: true },
       NOW,
-      0
+      () => 0
     )
     expect(state.consecutiveFailures).toBe(1)
     expect(state.openUntil).toBe(NOW + 1_000)
@@ -678,7 +678,7 @@ describe("recordFailure", () => {
         state,
         { kind: "server_error", cooldownMs: 1_000, retryNext: true },
         NOW,
-        0
+        () => 0
       )
       delays.push((state.openUntil ?? NOW) - NOW)
     }
@@ -692,7 +692,7 @@ describe("recordFailure", () => {
         state,
         { kind: "server_error", cooldownMs: 1_000, retryNext: true },
         NOW,
-        0
+        () => 0
       )
     }
     expect((state.openUntil ?? NOW) - NOW).toBe(15 * 60 * 1000)
@@ -703,7 +703,7 @@ describe("recordFailure", () => {
       initialTargetState("groq:x"),
       { kind: "misconfigured", cooldownMs: 86_400_000, retryNext: true },
       NOW,
-      0
+      () => 0
     )
     expect((state.openUntil ?? NOW) - NOW).toBe(86_400_000)
   })
@@ -713,13 +713,13 @@ describe("recordFailure", () => {
       initialTargetState("groq:x"),
       { kind: "server_error", cooldownMs: 1_000, retryNext: true },
       NOW,
-      0
+      () => 0
     )
     const fullJitter = recordFailure(
       initialTargetState("groq:x"),
       { kind: "server_error", cooldownMs: 1_000, retryNext: true },
       NOW,
-      0.99
+      () => 0.99
     )
     expect((noJitter.openUntil ?? NOW) - NOW).toBe(1_000)
     expect((fullJitter.openUntil ?? NOW) - NOW).toBeGreaterThan(1_000)
@@ -731,7 +731,7 @@ describe("recordFailure", () => {
       initialTargetState("groq:x"),
       { kind: "empty_output", cooldownMs: 0, retryNext: true },
       NOW,
-      0
+      () => 0
     )
     expect(state.openUntil).toBeNull()
     expect(isAvailable(state, NOW)).toBe(true)
@@ -744,7 +744,7 @@ describe("recordSuccess", () => {
       initialTargetState("groq:x"),
       { kind: "server_error", cooldownMs: 60_000, retryNext: true },
       NOW,
-      0
+      () => 0
     )
     const state = recordSuccess(failed, NOW)
     expect(state.consecutiveFailures).toBe(0)
@@ -759,6 +759,11 @@ describe("recordSuccess", () => {
 
 Run: `npx vitest run lib/ai/__tests__/circuit.test.ts`
 Expected: FAIL — cannot resolve `@/lib/ai/circuit`.
+
+Note the injected-random convention: `recordFailure`'s fourth argument is a
+`() => number`, not a number. Every test passes a thunk (`() => 0` for no jitter), because a
+bare literal would override the `Math.random` default and only appear to work — it is a
+function call the implementation makes, not a value it reads.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -866,7 +871,7 @@ export function recordSuccess(state: TargetState, now: number): TargetState {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `npx vitest run lib/ai/__tests__/circuit.test.ts`
-Expected: PASS — 10 tests.
+Expected: PASS — 9 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -1928,7 +1933,7 @@ export async function generateStructured<T>({
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `npx vitest run lib/ai/__tests__/structured.test.ts`
-Expected: PASS — 8 tests.
+Expected: PASS — 10 tests.
 
 If `z.toJSONSchema` is unavailable, the installed Zod major is not 4 — fix the install rather
 than adding `zod-to-json-schema`.
@@ -2835,7 +2840,7 @@ export function createGateway(deps: GatewayDeps = {}): Gateway {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `npx vitest run lib/ai/__tests__/gateway.test.ts`
-Expected: PASS — 10 tests.
+Expected: PASS — 9 tests.
 
 - [ ] **Step 5: Run the full suite and the typecheck**
 

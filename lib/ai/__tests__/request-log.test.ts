@@ -1,6 +1,6 @@
 // lib/ai/__tests__/request-log.test.ts
 import { describe, expect, it } from "vitest"
-import { logRequest, type RequestLogClient } from "@/lib/ai/request-log"
+import { logRequest, MAX_LOGGED_TOOLS, type RequestLogClient } from "@/lib/ai/request-log"
 
 function fakeClient() {
   const inserted: Record<string, unknown>[] = []
@@ -72,5 +72,82 @@ describe("logRequest", () => {
       { client }
     )
     expect(inserted[0].degraded_reason).toBe("retrieval_budget_exceeded")
+  })
+
+  it("records the pipeline's plan source, tools and citation verdict", async () => {
+    const { client, inserted } = fakeClient()
+    await logRequest(
+      {
+        outcome: "ok",
+        attempts: [],
+        planSource: "router",
+        tools: ["lookup_character", "next_unwatched"],
+        citationsValid: true,
+      },
+      { client }
+    )
+    expect(inserted[0]).toMatchObject({
+      plan_source: "router",
+      citations_valid: true,
+    })
+    expect(inserted[0].tools).toEqual(["lookup_character", "next_unwatched"])
+  })
+
+  it("keeps an empty tool list and a false verdict out of the null default", async () => {
+    const { client, inserted } = fakeClient()
+    await logRequest(
+      { outcome: "ok", attempts: [], tools: [], citationsValid: false },
+      { client }
+    )
+    // Both are real answers: a falsy check would record them as "not measured",
+    // which in the log reads exactly like a row written before the pipeline.
+    expect(inserted[0].tools).toEqual([])
+    expect(inserted[0].citations_valid).toBe(false)
+  })
+
+  it("records null for the pipeline fields a v1 request never produced", async () => {
+    const { client, inserted } = fakeClient()
+    await logRequest({ outcome: "ok", attempts: [] }, { client })
+    expect(inserted[0]).toMatchObject({
+      plan_source: null,
+      tools: null,
+      citations_valid: null,
+    })
+  })
+
+  it("caps the recorded tool list, keeping the dispatched order", async () => {
+    const { client, inserted } = fakeClient()
+    await logRequest(
+      {
+        outcome: "ok",
+        attempts: [],
+        tools: ["t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8", "t9", "t10"],
+      },
+      { client }
+    )
+    expect(MAX_LOGGED_TOOLS).toBe(8)
+    expect(inserted[0].tools).toEqual(["t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8"])
+  })
+
+  it("still resolves when the store rejects a pipeline row", async () => {
+    const client: RequestLogClient = {
+      from: () => ({
+        insert: async () => {
+          throw new Error("boom")
+        },
+      }),
+    }
+    await expect(
+      logRequest(
+        {
+          outcome: "error",
+          attempts: [],
+          planSource: "fallback",
+          tools: ["lookup_character"],
+          citationsValid: false,
+        },
+        { client }
+      )
+    ).resolves.toBeUndefined()
   })
 })

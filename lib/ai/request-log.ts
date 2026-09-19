@@ -28,9 +28,22 @@ export interface RequestLogEntry {
   docCount?: number | null
   cacheHit?: boolean
   degradedReason?: string | null
+  /** Which planner decided: "router", "model" or "fallback" (Task 13). */
+  planSource?: string | null
+  /** The tools the plan dispatched, in execution order; capped before insert. */
+  tools?: string[] | null
+  /** Whether the answer's [E#] citations all resolved to supplied evidence. */
+  citationsValid?: boolean | null
   promptTokens?: number | null
   completionTokens?: number | null
 }
+
+/**
+ * The `tools` column's bound, not the pipeline's: the plan schema already limits
+ * a plan to four steps, so eight never truncates a real request while keeping a
+ * hand-built entry from writing an unbounded array into the row.
+ */
+export const MAX_LOGGED_TOOLS = 8
 
 export interface RequestLogDeps {
   client?: RequestLogClient | null
@@ -65,6 +78,12 @@ export async function logRequest(
       doc_count: entry.docCount ?? null,
       cache_hit: entry.cacheHit ?? false,
       degraded_reason: entry.degradedReason ?? null,
+      // `?? null`, never a falsy test: an empty tool list and a `false` citation
+      // verdict are real answers, and reading them as "not measured" would make
+      // a v2 request indistinguishable from a row written before the pipeline.
+      plan_source: entry.planSource ?? null,
+      tools: entry.tools?.slice(0, MAX_LOGGED_TOOLS) ?? null,
+      citations_valid: entry.citationsValid ?? null,
       prompt_tokens: entry.promptTokens ?? null,
       completion_tokens: entry.completionTokens ?? null,
     })

@@ -2192,6 +2192,9 @@ stream."
 // lib/ai/__tests__/gateway.test.ts
 import { describe, expect, it } from "vitest"
 import { createGateway } from "@/lib/ai/gateway"
+import { initialTargetState } from "@/lib/ai/circuit"
+import type { ProviderHealth } from "@/lib/ai/provider-health"
+import type { QuotaTracker } from "@/lib/ai/quota"
 import type { ProviderTarget } from "@/lib/ai/targets"
 
 const NOW = Date.parse("2026-09-19T10:00:00.000Z")
@@ -2230,9 +2233,47 @@ function streamingResponse(body: string, init: { status?: number; headers?: Reco
   )
 }
 
+/**
+ * Inert stores for the tests that are about streaming rather than about health
+ * or quota.
+ *
+ * Without them `createGateway` builds the REAL stores, and vitest loads
+ * `.env.local`, so those tests would be talking to the live project:
+ * `quota.consume` would spend real budget through the `rate_limit_hit` RPC, and
+ * `health.load` would query `ai_provider_state`, which this plan deliberately
+ * has not applied remotely. A unit test must not spend a real budget, and must
+ * not depend on a remote round trip to pass. Tests that need specific store
+ * behaviour pass their own fake and override these.
+ */
+function inertStores(): { health: ProviderHealth; quota: QuotaTracker } {
+  return {
+    health: {
+      async load(ids) {
+        return new Map(ids.map((id) => [id, initialTargetState(id)]))
+      },
+      isAvailable(state, at) {
+        return state.openUntil === null || state.openUntil <= at
+      },
+      async recordFailure() {},
+      async recordSuccess() {},
+    },
+    quota: {
+      async consume() {
+        return true
+      },
+    },
+  }
+}
+
+function createTestGateway(
+  deps: Parameters<typeof createGateway>[0] = {}
+): ReturnType<typeof createGateway> {
+  return createGateway({ ...inertStores(), ...deps })
+}
+
 describe("createGateway", () => {
   it("streams from the first healthy target and records success", async () => {
-    const gateway = createGateway({
+    const gateway = createTestGateway({
       now: () => NOW,
       fetchImpl: async () => streamingResponse(sse("Hello", " world")),
     })
@@ -2251,7 +2292,7 @@ describe("createGateway", () => {
 
   it("fails over to the next target on 429 and honours Retry-After", async () => {
     let call = 0
-    const gateway = createGateway({
+    const gateway = createTestGateway({
       now: () => NOW,
       fetchImpl: async () => {
         call += 1
@@ -2275,7 +2316,7 @@ describe("createGateway", () => {
   })
 
   it("reports failure when every target fails, and never throws", async () => {
-    const gateway = createGateway({
+    const gateway = createTestGateway({
       now: () => NOW,
       fetchImpl: async () => new Response("nope", { status: 429 }),
     })
@@ -2292,7 +2333,7 @@ describe("createGateway", () => {
 
   it("skips a target whose circuit is open", async () => {
     const fetchImpl = async () => streamingResponse(sse("hi"))
-    const gateway = createGateway({
+    const gateway = createTestGateway({
       now: () => NOW,
       fetchImpl,
       health: {
@@ -2341,13 +2382,19 @@ describe("createGateway", () => {
 
   it("flags a mid-stream failure but keeps the partial answer", async () => {
     const encoder = new TextEncoder()
-    const gateway = createGateway({
+    const gateway = createTestGateway({
       now: () => NOW,
+      // The error must be raised from pull(), not from start(): erroring a
+      // stream resets its queue, so enqueue-then-error inside start() would
+      // discard the chunk before the gateway ever reads it and the test would
+      // assert against zero text.
       fetchImpl: async () =>
         new Response(
           new ReadableStream({
             start(controller) {
               controller.enqueue(encoder.encode(sse("The victim was")))
+            },
+            pull(controller) {
               controller.error(new Error("connection reset"))
             },
           }),
@@ -2370,7 +2417,7 @@ describe("createGateway", () => {
 
   it("does not count a 200 response with no content as success", async () => {
     let call = 0
-    const gateway = createGateway({
+    const gateway = createTestGateway({
       now: () => NOW,
       fetchImpl: async () => {
         call += 1
@@ -2391,7 +2438,7 @@ describe("createGateway", () => {
   })
 
   it("passes through the reasoning channel separately", async () => {
-    const gateway = createGateway({
+    const gateway = createTestGateway({
       now: () => NOW,
       fetchImpl: async () =>
         streamingResponse(
@@ -2413,7 +2460,7 @@ describe("createGateway", () => {
 
   it("stops cleanly when the client aborts", async () => {
     const controller = new AbortController()
-    const gateway = createGateway({
+    const gateway = createTestGateway({
       now: () => NOW,
       fetchImpl: async () => {
         controller.abort()
@@ -2433,7 +2480,7 @@ describe("createGateway", () => {
   })
 
   it("skips a target whose daily budget is spent", async () => {
-    const gateway = createGateway({
+    const gateway = createTestGateway({
       now: () => NOW,
       fetchImpl: async () => streamingResponse(sse("hi")),
       quota: { async consume() { return false } },

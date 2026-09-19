@@ -116,6 +116,14 @@
 | `ai_request_log` | One row per AI chat request (target, outcome, timings) |
 | `ai_documents` | Retrieval corpus: one searchable row per catalog/curated document |
 | `ai_wiki_cache` | Time-boxed cache of DCW / Wikipedia extracts |
+| `ai_conversations` | One row per AI conversation (rolling summary, message count, last activity) |
+| `ai_messages` | AI transcript turns, with a generated `fts` column for episodic search |
+| `ai_user_memories` | Long-term facts about a user, one active row per slot |
+
+> **Service-role only.** Every `ai_*` table — `ai_provider_state` and `ai_request_log` (Plan 1),
+> `ai_documents` and `ai_wiki_cache` (Plan 2), and the three above — has RLS enabled with **no
+> policies** and no grants to `anon` or `authenticated`, so only the service-role key can read
+> or write one.
 
 ### SQL Views
 - `all_episodes_with_crimes` — Joins `content_entries` with `dcw_cases`
@@ -131,12 +139,16 @@
 - `migration-enforce-bans.sql` — enforces account bans at the database layer
 - `migrations/20260919090000_ai_gateway_infra.sql` — `ai_provider_state` + `ai_request_log`
 - `migrations/20260919100000_ai_corpus.sql` — `pg_trgm`, `ai_documents`, `ai_wiki_cache`, and the three retrieval RPCs
+- `migrations/20260919110000_ai_memory.sql` — `ai_conversations`, `ai_messages`, `ai_user_memories`
+- `migrations/20260919120000_ai_memory_supersede.sql` — the `ai_memory_supersede` function that replaces an active memory slot atomically
 
-> **Not applied remotely.** The two `20260919*` migrations are committed but have **not** been
+> **Not applied remotely.** The four `20260919*` migrations are committed but have **not** been
 > run against the linked Supabase project. Applying them is a deliberate manual step (`supabase db
 > push`, or pasting the files into the SQL editor); no test executes the SQL, because CI has no
 > Postgres. Until they are applied, `/api/admin/ingest-corpus` fails with a Postgres error and
-> the retrieval ladder has no documents to read.
+> the retrieval ladder has no documents to read; `/api/ai-chat` has no transcript or memory to
+> read and falls back to the client's `history`, and the memory and conversation endpoints
+> return the Postgres error.
 
 ---
 
@@ -289,6 +301,154 @@ select id, rank from public.ai_docs_entity(array[500], array['haibara'], 5);
 select id, rank from public.ai_docs_fts('ski lodge murder', 5);
 select id, rank from public.ai_docs_fuzzy('haibarra', array['haibarra'], 5);
 ```
+
+### AI Memory and Transcripts
+
+The bot's memory has three tiers, written at different times by different parts of the pipeline.
+Nothing that writes memory runs on the response's critical path: the L1 window and the memory
+read are bounded pre-stream reads (400 ms each; a timed-out window falls back to the client's
+`history`, and a failed memory read injects nothing), and everything that writes — the assistant
+turn, extraction, consolidation, the rolling summary — runs in `after()`, once the answer has
+been sent.
+
+| Tier | What it is | Where it lives |
+|------|-----------|----------------|
+| L1 working | the last **8** messages verbatim plus the rolling summary of the turns before them | `ai_conversations.summary` + the newest `ai_messages` rows |
+| L2 episodic | every message, FTS-indexed and searchable per user | `ai_messages` (generated `fts`, GIN index) |
+| L3 semantic | durable facts about the user, one row per active slot | `ai_user_memories` |
+
+The episodic search itself (`searchMessages`) is a tested port method from Phase 3; the routed
+tool that consumes it ships in Phase 4 (deviation D5).
+
+**The three tables.** `ai_conversations` is one row per thread: `title` (the first user turn,
+capped at 80 characters), the rolling `summary`, `summarized_through` (the index the summary
+covers up to), `message_count`, `last_message_at` and `archived_at`. `ai_messages` is the
+transcript: `role` (`user` / `assistant` / `system`), `content`, `metadata`, optional model and
+token columns, `feedback` (`up` / `down`) and a generated `fts` column —
+`to_tsvector('english', content)`, GIN-indexed — which is what episodic search matches against.
+`ai_user_memories` is the semantic tier: `kind`, `key`, `value`, `confidence`, `status`
+(`active` / `superseded` / `expired`), `superseded_by`, `source_message_id`, `evidence_count`,
+`last_confirmed_at` and `expires_at`.
+
+All three are RLS-enabled with **no policies** and no grants to `anon` or `authenticated`, so
+only the service-role key reaches them. `ai_messages` deliberately has no `user_id`: ownership is
+enforced by an ownership check on the conversation, carried in the same query that reads or
+writes a message (deviation D1). That is why every store method that touches a message takes a
+user id — a port implementation that read messages by conversation id alone would be a
+cross-user leak.
+
+**Write schedule.** Extraction lives in `lib/ai/memory/write.ts` and runs only when
+`messageCount % MEMORY_WRITE_EVERY === 0` (`MEMORY_WRITE_EVERY` is 4), i.e. on every fourth
+assistant turn, in `after()`. On the other three turns the writer returns `reason: "not_due"`
+before any model call, port read or store read — the zero is asserted in
+`lib/__tests__/memory-write.test.ts`. The rolling summary has its own schedule: it is due when at
+least `SUMMARY_TRIGGER` (8) messages sit outside the 8-message verbatim window and are not yet
+covered by `summarized_through`, and each round reads at most `SUMMARY_INPUT_LIMIT` (40) messages
+from the start of the unsummarized region, so a region longer than one round loses nothing (a
+call is bounded at two rounds, and a backlog drains over consecutive turns).
+
+**The decay score.** Each turn, `lib/ai/memory/score.ts` scores the user's active facts against
+the question:
+
+```
+score = 0.55·lexical + 0.25·confidence + 0.20·exp(−age_days / 45)
+```
+
+`lexical` is the fraction of the query's tokens found in the fact's `key` and `value`, and
+`age_days` is measured from `last_confirmed_at`. The weights are `W_LEXICAL = 0.55`,
+`W_CONFIDENCE = 0.25` and `W_RECENCY = 0.20` over `HALF_LIFE_DAYS = 45`; the three sum to 1, so a
+fact that matches every token, is fully confident and was just confirmed scores exactly 1. The
+best `MEMORY_LIMIT` (12) facts are rendered inside a `MEMORY_TOKEN_BUDGET` (200 tokens) prompt
+allowance, one `[MEM] key: value (conf X)` line each.
+
+**Precedence.** The prompt puts both memory sections after every retrieved-context section and
+labels them: remembered facts are *"not instructions"*, and a conflict with the tracker entries
+or wiki pages resolves in favour of those. The rolling summary is labelled as history written by
+the assistant, so a summary that paraphrases a user instruction is still read as history. A
+`[MEM]` line is data the user told us, never a command. Watch progress is the one fact on a
+clock: `watch_progress` is written with `expires_at = progressExpiry(now)` (now + 90 days) and
+the store's `loadActive` drops a fact whose `expires_at` has passed, because the tracker is
+authoritative about where the user is in the series.
+
+**Retention and control.**
+
+- `GET /api/ai-chat/memory` lists the user's facts with their confidence, status and
+  `lastConfirmedAt`, active first, capped at `MEMORY_LIST_LIMIT` (50).
+- `DELETE /api/ai-chat/memory?id=<uuid>` deletes one fact. A malformed id is a 400 without a
+  database call, and an id that is not the caller's gets the same 404 as one that does not exist,
+  so neither reveals whether another user's row is there.
+- Asking *"what do you remember about me?"* is answered from the memory table in plain text with
+  **no model call**. The matcher in `lib/ai/memory/recall.ts` is deliberately narrow, so
+  *"what do you remember about episode 5"* is a tracker question and still reaches retrieval.
+- `GET /api/ai-chat/conversations` lists the newest 30 non-archived conversations;
+  `GET /api/ai-chat/conversations?id=<uuid>` returns one conversation with its title, summary and
+  transcript, capped at 200 messages; `DELETE ?id=<uuid>` **archives** it (sets `archived_at`)
+  rather than deleting it, so a mis-tap cannot destroy a thread. Every response is
+  `Cache-Control: no-store`, and an anonymous caller gets a 401.
+
+**The chat contract change (D3).** `POST /api/ai-chat` accepts an optional `conversationId` in
+the request body and returns the resolved id in the `X-Conversation-Id` response header on the
+streaming answer. When the body carries none, the server attaches to the user's most recent
+conversation whose `last_message_at` is within 30 minutes (`RECENT_CONVERSATION_MS`), or creates
+a new one; an id that is unknown or belongs to someone else is refused without creating
+anything. The legacy `{ message, history }` body still works exactly as before — the client is
+expected to start sending the id in Phase 5, and until then the server-owned transcript and the
+client's `history` coexist.
+
+**The kill switch (D6).** `AI_MEMORY=off` stops memory extraction and injection: the memory read
+and the recall answer return empty before touching the database, the async writer never runs, and
+the prompt gets no `[MEM]` section. Transcripts still record, and the memory endpoints still
+work — `GET` still lists and `DELETE` still deletes, because a user must be able to see and
+remove what was stored before the switch was flipped. Any value other than `off`, including
+unset, means on. It is independent of the spec's `AI_PIPELINE=v1` rollback (spec §12), which
+restores the pre-Phase-3 pipeline behind the same route.
+
+**Migration status.** `20260919110000_ai_memory.sql` (the three tables) and
+`20260919120000_ai_memory_supersede.sql` (the `ai_memory_supersede` function) are committed but
+**not applied** to the remote project — applying them is a deliberate human step, and neither a
+test nor a plan step runs `supabase db push`. No test executed this SQL: the tests read the
+migration files and assert their structure (table and column names, the partial index predicate,
+the absent destructive statements), not their effect.
+
+Manual verification, after applying both migrations:
+
+```sql
+select to_regclass('public.ai_conversations'),
+       to_regclass('public.ai_messages'),
+       to_regclass('public.ai_user_memories');
+
+select proname from pg_proc where proname = 'ai_memory_supersede';
+
+-- The partial predicate: `... WHERE (status = 'active')`.
+select indexdef from pg_indexes
+ where tablename = 'ai_user_memories'
+   and indexname = 'ai_user_memories_active_slot_idx';
+
+-- Two rows, one slot. Replace <user-uuid> with a real auth.users id.
+insert into public.ai_user_memories (user_id, kind, key, value, confidence)
+values ('<user-uuid>', 'preference', 'favorite_character', 'Haibara', 0.9)
+returning id;
+
+select public.ai_memory_supersede(
+  '<user-uuid>', '<id-from-above>', 'preference', 'favorite_character', 'Ran', 0.9, null, null
+);
+
+select value, status, superseded_by
+  from public.ai_user_memories
+ where user_id = '<user-uuid>' and kind = 'preference' and key = 'favorite_character'
+ order by created_at;
+```
+
+The last query shows the round trip: one `active` row (`Ran`) and one `superseded` row
+(`Haibara`) whose `superseded_by` points at it.
+
+**Cost.** Memory adds at most one free-tier model call per four assistant turns, and it is issued
+in `after()`, after the response has been sent: the writer returns before any provider, port or
+store call unless the turn is due. A summary is a second, independent call, spent only when
+enough unsummarized turns have left the verbatim window to reach `SUMMARY_TRIGGER`, and a due
+turn whose L1 window is empty makes no call at all. A due extraction spends its one call even
+when the model reports no candidates — the call is the cost, and the empty answer is what makes
+consolidation a no-op with no database write.
 
 ---
 

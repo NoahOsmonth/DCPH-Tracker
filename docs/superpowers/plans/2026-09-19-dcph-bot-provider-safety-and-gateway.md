@@ -2953,13 +2953,17 @@ import { rateLimitPersistent } from "@/lib/rate-limit-db"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
-// The gateway enforces its own 60s ceiling; this stops the platform from
-// cutting the response first, which would look like a provider failure.
+// A ceiling for the platform, not the working limit: the route enforces its own
+// shorter budget below, so a long answer is labelled as cut short by us rather
+// than being killed by the platform with no explanation.
 export const maxDuration = 60
 
 const MAX_MESSAGE_CHARS = 1000
 const MAX_HISTORY_MESSAGES = 8
 const MAX_BODY_BYTES = 16_000
+
+/** Whole-request deadline, deliberately below `maxDuration`. */
+const TOTAL_BUDGET_MS = 45_000
 
 const RATE_LIMIT = { limit: 20, windowMs: 5 * 60 * 1000 }
 
@@ -3165,41 +3169,58 @@ export async function POST(request: Request) {
         }
       }
 
-      const result = await gateway.streamChat({
-        messages,
-        targets,
-        signal: request.signal,
-        onDelta: (text) => {
-          if (firstTokenMs === null) firstTokenMs = Date.now() - requestStartedAt
-          try {
-            controller.enqueue(encoder.encode(text))
-          } catch {
-            closed = true
-          }
-        },
-      })
+      const enqueue = (text: string) => {
+        try {
+          controller.enqueue(encoder.encode(text))
+        } catch {
+          closed = true
+        }
+      }
+
+      // One budget for the whole request, not one per provider. The gateway's
+      // timeouts are per target, so a run of stalled providers can outlast the
+      // platform's own limit — and a response the platform cuts never gets the
+      // "cut short" label. Aborting ourselves keeps that label ours to write.
+      const budget = new AbortController()
+      const budgetTimer = setTimeout(() => budget.abort(), TOTAL_BUDGET_MS)
+      const abortOnDisconnect = () => budget.abort()
+      if (request.signal.aborted) {
+        budget.abort()
+      } else {
+        request.signal.addEventListener("abort", abortOnDisconnect)
+      }
+
+      let result
+      try {
+        result = await gateway.streamChat({
+          messages,
+          targets,
+          signal: budget.signal,
+          onDelta: (text) => {
+            if (firstTokenMs === null) firstTokenMs = Date.now() - requestStartedAt
+            enqueue(text)
+          },
+        })
+      } finally {
+        clearTimeout(budgetTimer)
+        request.signal.removeEventListener("abort", abortOnDisconnect)
+      }
 
       if (result.aborted) {
+        // Our own budget expiring is not the same as the user closing the tab:
+        // in the first case they are still listening and the answer must be
+        // labelled, in the second there is nobody left to tell.
+        if (result.textChars > 0 && !request.signal.aborted) {
+          enqueue(PARTIAL_RESULT_SUFFIX)
+        }
         close()
-        return
+      } else if (!result.ok) {
+        enqueue(result.rateLimited ? RATE_LIMITED_MESSAGE : EMPTY_RESULT_MESSAGE)
+        close()
+      } else {
+        if (result.midStreamFailure || result.truncated) enqueue(PARTIAL_RESULT_SUFFIX)
+        close()
       }
-
-      if (!result.ok) {
-        const message = result.rateLimited ? RATE_LIMITED_MESSAGE : EMPTY_RESULT_MESSAGE
-        try {
-          controller.enqueue(encoder.encode(message))
-        } catch {
-          closed = true
-        }
-      } else if (result.midStreamFailure || result.truncated) {
-        try {
-          controller.enqueue(encoder.encode(PARTIAL_RESULT_SUFFIX))
-        } catch {
-          closed = true
-        }
-      }
-
-      close()
 
       // Fire-and-forget: observability must not delay or fail the response.
       void logRequest({

@@ -218,11 +218,14 @@ describe("runLadder", () => {
 
     await runLadder({ query: "who is Ai Haibara" }, { source: fake.source, now: clock.now })
 
+    // The keywords keep the query's word order, not the specificity order the
+    // cap is decided by: the scorer's phrase bonus asks whether the user's words
+    // appear together in the title, so the run has to be the run they typed.
     expect(fake.fuzzyCalls).toEqual([
-      { query: "who is Ai Haibara", keywords: ["haibara", "ai"], limit: FUZZY_CANDIDATES },
+      { query: "who is Ai Haibara", keywords: ["ai", "haibara"], limit: FUZZY_CANDIDATES },
     ])
     // R1's names are the normalized query plus the same keywords, in that order.
-    expect(fake.entityCalls[0].names).toEqual(["who is ai haibara", "haibara", "ai"])
+    expect(fake.entityCalls[0].names).toEqual(["who is ai haibara", "ai", "haibara"])
   })
 
   it("lets a supplied keywords array win over the derived one", async () => {

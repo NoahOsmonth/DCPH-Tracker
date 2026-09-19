@@ -141,14 +141,17 @@
 - `migrations/20260919100000_ai_corpus.sql` — `pg_trgm`, `ai_documents`, `ai_wiki_cache`, and the three retrieval RPCs
 - `migrations/20260919110000_ai_memory.sql` — `ai_conversations`, `ai_messages`, `ai_user_memories`
 - `migrations/20260919120000_ai_memory_supersede.sql` — the `ai_memory_supersede` function that replaces an active memory slot atomically
+- `migrations/20260919130000_ai_request_log_pipeline.sql` — `plan_source`, `tools` and `citations_valid` on `ai_request_log`
 
-> **Not applied remotely.** The four `20260919*` migrations are committed but have **not** been
+> **Not applied remotely.** The five `20260919*` migrations are committed but have **not** been
 > run against the linked Supabase project. Applying them is a deliberate manual step (`supabase db
 > push`, or pasting the files into the SQL editor); no test executes the SQL, because CI has no
-> Postgres. Until they are applied, `/api/admin/ingest-corpus` fails with a Postgres error and
-> the retrieval ladder has no documents to read; `/api/ai-chat` has no transcript or memory to
-> read and falls back to the client's `history`, and the memory and conversation endpoints
-> return the Postgres error.
+> Postgres. Until they are applied, `/api/admin/ingest-corpus` fails with a Postgres error and the
+> indexed corpus is empty, so the agentic pipeline answers from its in-process static corpus
+> instead (see "Agentic pipeline"); `/api/ai-chat` has no transcript or memory to read and falls
+> back to the client's `history`, and the memory and conversation endpoints return the Postgres
+> error; and the request log's insert fails on the three new pipeline columns, a fire-and-forget
+> write that costs no answer.
 
 ---
 
@@ -232,6 +235,9 @@ User question (Signed-in member)
       → Stream plain text response back
     → ChatWidget renders streaming markdown
 ```
+
+The retrieval line above is v1's path, which `AI_PIPELINE=v1` restores; by default (unset) the
+same route retrieves through the agentic pipeline — see "Agentic pipeline" below.
 
 ### Key Chatbot Features
 1. **Member-Only Access Gating**: Unauthenticated visitors see a friendly lock card with a one-click "Sign In to Chat" button triggering Supabase Auth modal. Server returns 401 Unauthorized for anonymous calls.
@@ -449,6 +455,249 @@ enough unsummarized turns have left the verbatim window to reach `SUMMARY_TRIGGE
 turn whose L1 window is empty makes no call at all. A due extraction spends its one call even
 when the model reports no candidates — the call is the cost, and the empty answer is what makes
 consolidation a no-op with no database write.
+
+### Agentic pipeline
+
+By default `/api/ai-chat` answers through the agentic pipeline: retrieve, screen, assemble,
+answer, validate. It is Phase 4's path, and it runs behind the same route — the guards, auth,
+rate limit and intent refusal, Plan 3's transcript and memory reads, the gateway and the stream
+are unchanged. Code owns the loop; the model may make one narrow, schema-validated decision
+(which tools to run) and then writes the answer. `AI_PIPELINE=v1` restores the previous path entirely,
+so nothing in this section runs then.
+
+**The call path.**
+
+```text
+POST /api/ai-chat  guards → auth → rate limit → intent refusal
+  → persistence: window and memory reads, recall branch     lib/chat/persistence.ts
+  → runPipeline                                             lib/ai/pipeline/index.ts
+      → resolveRetrievalDeps   indexed corpus, else cached static (D2)
+      → planQuery              router first, planner when unsure (D1)
+      → executePlan            ladder + tools in one round trip, merged by id
+      → screenEvidence         injection screening: exclude or redact (D4)
+      → assembleMessages       budgets, provenance tags, [E1] numbering
+  → streamChat                 the unchanged gateway path   lib/ai/gateway.ts
+  → validateCitations          on the accumulated answer, after the stream (D3)
+  → logRequest                 fire-and-forget, never awaited
+  → after()                    Plan 3's memory and transcript work, unchanged
+```
+
+The stages are `lib/ai/pipeline/`'s `index.ts` (the composition), `source-resolver.ts`,
+`planner.ts`, `router.ts`, `plan.ts` (the schema), `execute.ts` and `assemble.ts`, with screening
+in `lib/ai/prompt/screen.ts`, the citation contract in `lib/ai/citations.ts`, and the eighth tool
+in `lib/ai/tools/search-conversations.ts`. Every stage carries a hard bound — the planner
+1,200 ms, the corpus probe 400 ms, execution 2,000 ms — and a stage that overruns degrades
+instead of extending the request; the route's `TOTAL_BUDGET_MS` (45 s) is one clock shared by the
+planner and the answer stream, so a client that disconnects while the planner is thinking aborts
+it. Three v2-specific route behaviours are deliberate: the retrieval context handed to
+`buildSystemPrompt` is empty while the watch history stays a real, bounded read (`searchAll` used
+to fetch it for free), the memory block and the rolling summary are **not** passed to the prompt
+builder because the assembler owns both sections, and the refusal gate keeps
+`shouldRefuseForMissingContext` and its signature, with `hasContext` on v2 meaning "the assembly
+holds at least one document or wiki extract" (D8). The pipeline never throws: a total failure
+returns a result with `degraded: "pipeline_failed"` and an empty evidence set, which the refusal
+gate answers honestly.
+
+**The `QueryPlan` contract.** One object per request (`lib/ai/pipeline/plan.ts`), validated by a
+Zod schema before any stage reads it. The plan may decide which of the eight tools to run
+(`search_catalog`, `search_cases`, `lookup_character`, `classify_episode`, `arc_for_range`,
+`next_unwatched`, `wiki_lookup`, `search_conversations`), each step's arguments, the retrieval
+keywords and numbers the ladder searches with, whether the question needs the wiki round
+(`needsLore`), and its chronological preference. It may not decide the prompt, the budgets, or
+the evidence the tools return: a tool call is the only way to reach a fact, and every fact is
+screened, budgeted and tagged by code. The caps are `MAX_PLAN_STEPS` (4), `MAX_PLAN_KEYWORDS`
+(8) and `MAX_PLAN_NUMBERS` (8); a step that violates the schema rejects the whole plan rather
+than being half-applied, and identical steps collapse so no tool call is spent twice. The
+deterministic router (`lib/ai/pipeline/router.ts`) answers first and the planner is the
+escalation (D1): the router recognizes the curated names the corpus is built from, reads episode
+and range references, decides whether a question is lore-shaped, and marks itself confident only
+on an unambiguous entity or number hit, a list, a refusal or a greeting — never on a comparison
+or a lore question. Which path won is recorded per request as `plan_source` (`router`, `model`
+or `fallback`).
+
+**`AI_PLANNER`.** Three modes, read by `plannerMode` (`lib/ai/pipeline/planner.ts`): `auto` (the
+default), `always` and `off`; any other value, unset included, is `auto`. `auto` calls the model
+only when the router is not confident, `always` restores the spec's literal two-call hot path,
+and `off` never spends the call. The call is `generateStructured` over the plan schema on a
+schema-capable gateway target, bounded at `PLANNER_BUDGET_MS` (1,200 ms) and inside the shared
+request clock; D1's rationale is the quota — on a free tier a model call is a budget, so a
+confident router spends nothing, and only a genuinely ambiguous question pays. Every failure — a
+timeout, a provider rejection, a schema-invalid reply, an empty step list, or a floor-only plan
+with no keywords — returns the router's plan with `source: "fallback"` and a short error code
+(`planner_timeout`, `planner_failed`, `planner_invalid`, `planner_no_steps`,
+`planner_empty_search`). The planner never rejects and never returns null, and with no
+schema-capable target injected it stays on the router's plan and spends nothing.
+
+**`AI_PIPELINE`.** Unset, empty or any value other than exactly `v1` runs v2 (surrounding
+whitespace is tolerated, case is not). `v1` restores the previous path behind the same route —
+`searchAll` plus the Plan 3 prompt, byte-for-byte in behaviour — and it therefore gets none of
+v2's properties: no plan is made and `plan_source` is not written, nothing is screened so
+`degraded_reason` can never be `"screened"`, citations are not validated and `citations_valid`
+stays null, and the memory block and rolling summary go back into `buildSystemPrompt` instead of
+being owned by the assembler. It remains the rollback (constraint 11), and
+`app/api/ai-chat/route.integration.test.ts` — which sets the variable in its `beforeEach` — is
+the standing v1 regression test.
+
+**Source resolution.** `resolveRetrievalDeps` (`lib/ai/pipeline/source-resolver.ts`) decides
+which corpus the request reads. `indexed` reads `ai_documents` through Plan 2's three RPCs;
+`static` reads the corpus built in this process from the curated guides plus the live tracker
+rows — the same documents the ingestion route would write. Reachability is asked directly, never
+inferred from a row count: one `ai_documents` select of one column and one row under a
+`CORPUS_PROBE_MS` (400 ms) box decides it, because `createSupabaseSource` answers `[]` for both
+"no rows" and "no table", and an empty table is the expected pre-ingestion state while a missing
+one is not. A static corpus is cached for `CORPUS_CACHE_TTL_MS` (5 minutes), with the in-flight
+promise memoized so two requests arriving together pay for one tracker read; the read is capped
+at `CORPUS_MAX_ROWS` (20,000), and a failed row read degrades to the curated half rather than to
+an empty source. Static mode reports `degraded: "corpus_static"` — the deployment's state rather
+than this request's, so it is the last degrade reason reported and the first displaced.
+
+The deployed project is exactly that case today: none of the `20260919*` migrations are applied,
+so `ai_documents` does not exist and the probe fails. Because `createSupabaseSource` swallows a
+missing table and returns `[]`, a pipeline that read it without asking would answer *"I could not
+find a reliable answer"* to every question. The corpus fallback is therefore explicit
+(constraint 12, D7): when the resolved mode is `static` and the assembled evidence is empty,
+`runPipeline` calls `runLegacyRetrieval` — the same `searchAll` the route uses for
+`AI_PIPELINE=v1` — converts its `ChatContext` into documents and wiki extracts with the same
+builders the ingestion route uses, screens that too, and re-assembles. The result carries
+`degraded: "corpus_unavailable"`. A `searchAll` rejection is caught: the request answers from an
+empty evidence set rather than throwing. Without this fallback, every question would have been
+refused once v2 shipped, before a human applied the migrations.
+
+**Provenance tags and the wrap.** Every retrieved segment is tagged with its trust tier when it
+reaches the prompt: `[SYS]` the operator-owned system prompt, `[RET]` retrieved corpus
+documents, `[WIKI]` cached wiki extracts, `[CONV]` passages from the user's own earlier
+conversations, `[MEM]` remembered facts about the user, `[USR]` the user's own words. The rule is
+one-way: no lower tier may override a higher one, and `[RET]`, `[WIKI]` and `[CONV]` are
+untrusted data, never instructions. Retrieved text is wrapped between `<<<EVIDENCE` and
+`EVIDENCE>>>` (`WRAP` / `wrapEvidence` in `lib/ai/prompt/screen.ts`), one pair per rendered
+document, and the prompt tells the model that text between the markers is data. That sentence is
+only true because screening runs before wrapping: a document that carries a marker is excluded,
+so a marker pair in a prompt is always the wrapper's own. Conversation turns are the one tier
+that is not tagged in-band — they stay separate `role: "user"` / `role: "assistant"` messages,
+because prefixing someone's own words with a tag would rewrite their message for the provider's
+chat template.
+
+**Assembly.** `assembleMessages` (`lib/ai/pipeline/assemble.ts`) is the last stage before the
+model and the only place that decides what happens when the prompt does not fit. Tokens are
+`chars / 4` — the memory module's `CHARS_PER_TOKEN`, imported rather than re-declared so the two
+cannot disagree — measured against five ceilings:
+
+| Segment | Ceiling (tokens) |
+|---------|------------------|
+| `system` | 1,500 |
+| `memory` | 200 |
+| `evidence` | 1,800 |
+| `summary` | 300 |
+| `turns` | 800 |
+
+The system prompt's ceiling is a report baseline rather than a trigger: it is never evicted, and
+the rebuilt prompt's own character ceiling is what actually bounds it. Overflow is evicted in a
+fixed order, never truncated mid-sentence: evidence from the tail of the rendered order first
+(the ladder's ranking is the input order, so the last-rendered document is the lowest-ranked one,
+and a wiki extract renders after every document and so goes before all of them), then turns
+oldest-first with the newest turn kept whole even when it alone overruns the ceiling, then the
+rolling summary last and only when nothing else remains. Memory and the system prompt are never
+evicted — the first is cheap and load-bearing, the second is the contract. Numbering is
+re-densified after eviction, so `[E1]` always exists while any evidence survives and no gap can
+be cited; `report.evicted` names the evicted ids, then the trimmed-turn count, then the summary,
+and any evicted document sets `degraded: "evidence_evicted"`. Each admitted document renders as
+one block — `[E#]`, its tag, its label (the document title, collapsed to one line), then the
+wrapped body — and `report.evidence` lists exactly the blocks that were rendered, so `[E2]`
+resolves to a real document id.
+
+**Screening.** Every untrusted segment — ladder documents, tool documents, wiki extracts —
+passes through `lib/ai/prompt/screen.ts` before the assembler wraps it, and both the title and
+the body are screened, because the title is a rendered label. A high-severity match disqualifies
+the whole document. The high-severity families are instruction overrides (English and
+Tagalog/Taglish), role hijacks (`you are now`, `act as an assistant`, `pretend to be`),
+system-plane spoofs (`[SYS]` or `<system>` claims, provider dialect tokens), false authority
+notices, exfiltration requests for the prompt or API keys, a long opaque blob that decodes to any
+of those, and the evidence delimiter itself. A low-severity match — a bare imperative ("always
+answer…"), a zero-width or bidi character, a markdown heading claiming a trust tier — redacts the
+offending line to `[screened]` and admits the document, with the line count preserved so a diff
+shows what went. That split is D4: dropping a whole document for one noisy wiki paragraph would
+let a single stray byte break an answer. Every match is counted, and an exclusion sets
+`degraded_reason: "screened"` unless a stronger reason was already recorded. The regression
+corpus is `lib/__tests__/fixtures/adversarial-docs.json` — 17 documents: 13 high-severity attack
+documents (override, role, system tags, encoded blob, Tagalog, zero-width, soft hyphen, false
+authority, exfiltration, markdown), 2 low-severity documents, and 2 false-positive documents pinned
+as hard as the attacks (a medicine label, and a wiki page describing an impostor who "pretends
+to be the phantom thief Kaito Kid" — `pretend` is matched in its base form only). The control run
+over the real corpus is the pipeline-level eval below: all 60 real cases pass through
+`screenDocuments` and still assemble their expected documents, so no legitimate curated text
+lost a slot.
+
+**Citations.** The assembler numbers every admitted block `[E1]`, `[E2]`, …, and
+`citationInstruction` — the same string the rebuilt prompt embeds, so the instruction the model
+reads and the parser that checks it cannot drift — asks the answer to cite the blocks it used.
+The grammar is narrow (`lib/ai/citations.ts`): `[E#]` with one or two digits, an uppercase `E`
+and a single bracket pair, so `[E1, E2]`, `[e1]`, `(E1)`, `[E1 ]`, `[E0]` and `[[E1]]` are not
+citations. `MAX_CITATIONS` (12) is the ceiling the instruction quotes, not the parser's limit:
+validation resolves every `[E#]` against the evidence actually supplied, and `[E12]` when five
+documents were given parses and then lands in `unknown` rather than disappearing. Two conditions
+make `citations_valid` true: nothing was fabricated, and a citation exists whenever one was
+required. `requireCitation` is "evidence was supplied at all", so a greeting with nothing to cite
+is neither invalid nor uncited, while a fabricated number is invalid even then — the flag
+forgives a missing citation, not an invented one. An evidence-backed answer that cites nothing
+valid is recorded as `degraded_reason: "uncited"`. Validation reads the accumulated answer text —
+never the synthetic rate-limited or partial-answer strings — and never rewrites a character of
+it: Phase 4 records, Phase 5 renders chips.
+
+**The request log.** `ai_request_log` gained three nullable columns, written only when
+`runPipeline` returned a result (`lib/ai/request-log.ts`):
+
+| Column | Type | Meaning |
+|--------|------|---------|
+| `plan_source` | `text` | `router`, `model` or `fallback` — which planner decided |
+| `tools` | `text[]` | the dispatched tools, deduped, in execution order |
+| `citations_valid` | `boolean` | whether every cited `[E#]` resolved to supplied evidence |
+
+The mapping uses `?? null`, never a falsy test, so an empty tool list (`[]`) and a `false`
+citation verdict survive as real answers; null means the row predates the pipeline. `tools` is
+capped at `MAX_LOGGED_TOOLS` (8) before insert — the plan caps itself at four steps, so the bound
+never truncates a real request. A `v1` request leaves all three null, and so does a v2 request
+whose pipeline threw. `degraded_reason` on v2 carries, in precedence order, `retrieval_failed`,
+the pipeline's own reason (`pipeline_failed`, `corpus_unavailable`, `execute_budget`,
+`ladder_failed`, `tool_failed`, `retrieval_budget`, `evidence_evicted`, `corpus_static`),
+`screened`, then `uncited`; `plan_ms` is the planner stage's measurement.
+
+**Migration status.** `20260919130000_ai_request_log_pipeline.sql` adds the three columns above
+and is committed but **not applied** to the remote project, like the four `20260919*` migrations
+before it.
+It is additive: three `add column if not exists`, all nullable, no default, and no policy or
+grant — `20260919090000` already enables RLS on `ai_request_log` with no policies, and
+restating access control is how an additive migration accidentally widens a table only
+`service_role` may touch. No test executes the SQL:
+`lib/__tests__/ai-request-log-migration.test.ts` reads the file and asserts its structure (the
+three columns, their nullability, the absent destructive statements), because CI has no Postgres.
+Applying it is a deliberate manual step, like the others.
+
+Manual verification, after applying the migration:
+
+```sql
+select column_name, is_nullable, column_default
+  from information_schema.columns
+ where table_schema = 'public'
+   and table_name = 'ai_request_log'
+   and column_name in ('plan_source', 'tools', 'citations_valid');
+-- Three rows, each is_nullable = 'YES' with a null column_default.
+```
+
+**Cost.** v2 adds at most one model call per request, and only when `AI_PLANNER=auto` and the
+router is not confident — on the turns where it is sure, and under `off`, the planner spends
+nothing. Retrieval and the tools cost no quota at all: the ladder is SQL through the service-role
+client (and the static fallback runs in process), the tools are in-process reads, and screening,
+assembly and citation validation are pure functions. Memory extraction is unchanged from Phase 3
+— every fourth assistant turn, in `after()`, after the answer has been sent. Nothing here
+crosses a paid tier or adds a provider.
+
+**Measured.** Both golden evals run offline, with no database, model or network, and both gate at
+`RECALL_GATE` (0.85). The retrieval-level eval (`lib/__tests__/retrieval-eval.test.ts`) measures
+the ladder over the 60 hand-authored cases at **0.9833** (59 of 60) — 0.9667 before Task 14's
+word-order fix in `lib/chat/query.ts`. The pipeline-level eval
+(`lib/__tests__/pipeline-eval.test.ts`) measures what the assembled prompt actually numbers,
+through the router, the executor, the screener and the assembler over the same 60 cases, at
+**1.0000 (60/60)**.
 
 ---
 

@@ -86,9 +86,17 @@ export interface EvidenceRef {
 
 export type Segment = "system" | "memory" | "evidence" | "summary" | "turns"
 
-/** The per-segment ceilings, in tokens (spec §8.2's table). */
+/**
+ * The per-segment ceilings, in tokens (spec §8.2's table, with one correction).
+ * The spec said 900 for the system prompt; the rebuilt prompt measures 1,324
+ * tokens of kept-verbatim product rules, so the ceiling moved to the smallest
+ * round number above that measurement. Unlike the other four this one is a
+ * report baseline rather than a trigger: the system prompt is never evicted,
+ * and `lib/__tests__/chat-prompt.test.ts`'s character ceiling is what actually
+ * bounds it.
+ */
 export const BUDGETS: Record<Segment, number> = {
-  system: 900,
+  system: 1500,
   memory: 200,
   evidence: 1800,
   summary: 300,

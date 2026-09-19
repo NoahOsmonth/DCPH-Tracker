@@ -223,11 +223,18 @@ ${citationInstruction(MAX_CITATIONS)}`
   )
 
   if (isSignedIn) {
+    // The claim about the watch list is made only when the list is actually
+    // present: the section is gated on `context.watchHistory`, so an
+    // unconditional sentence would tell the model to check a list it never got.
     sections.push(
-      `The user is signed in${displayName ? ` as ${displayName}` : ""}.
+      `The user is signed in${displayName ? ` as ${displayName}` : ""}.${
+        hasWatchHistory(context.watchHistory)
+          ? `
 Their watch history is included. When recommending something, prefer entries
 they have not watched. If they ask "have I seen X?", check the list and answer
 yes/no with the entry as evidence.`
+          : ""
+      }`
     )
   }
 

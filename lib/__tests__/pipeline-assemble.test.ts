@@ -117,12 +117,33 @@ function commonPrefix(a: string, b: string): string {
 /* ------------------------------------------------------------------ */
 
 describe("assembleMessages budgets", () => {
-  it("publishes the spec's budget table and the memory module's token convention", () => {
-    expect(BUDGETS).toEqual({ system: 900, memory: 200, evidence: 1800, summary: 300, turns: 800 })
+  it("publishes the budget table and the memory module's token convention", () => {
+    // `system` is 1500 rather than the spec's 900: the rebuilt prompt measures
+    // 1,324 tokens, which the constant records instead of pretending otherwise.
+    expect(BUDGETS).toEqual({ system: 1500, memory: 200, evidence: 1800, summary: 300, turns: 800 })
     expect(CHARS_PER_TOKEN).toBe(4)
     // One source of truth: the two modules cannot disagree about a token.
     expect(CHARS_PER_TOKEN).toBe(MEMORY_CHARS_PER_TOKEN)
     expect(BUDGETS.memory).toBe(MEMORY_TOKEN_BUDGET)
+  })
+
+  it("keeps the system prompt even when it is over any ceiling", () => {
+    // The prompt is never evicted, so this must hold for a prompt far larger
+    // than the constant above rather than only for one that happens to exceed
+    // it — otherwise a future constant change would quietly retire the check.
+    const huge = `## Huge\n\n${"rules ".repeat(20_000)}`
+    const result = assembleMessages({
+      systemPrompt: huge,
+      memories: "",
+      summary: null,
+      turns: [],
+      docs: [],
+      wiki: [],
+    })
+
+    expect(result.messages[0].content.startsWith(huge)).toBe(true)
+    expect(result.report.tokens.system).toBeGreaterThan(BUDGETS.system)
+    expect(result.report.evicted).toEqual([])
   })
 })
 
@@ -231,16 +252,6 @@ describe("assembleMessages rendering", () => {
 /* ------------------------------------------------------------------ */
 
 describe("assembleMessages budgets and eviction", () => {
-  it("keeps the system prompt even when it overruns its ceiling", () => {
-    const result = assembleMessages(
-      input({ systemPrompt: "y".repeat(4000), docs: [doc("entry:1")] })
-    )
-
-    expect(result.report.tokens.system).toBeGreaterThan(BUDGETS.system)
-    expect(systemOf(result).startsWith("y".repeat(4000))).toBe(true)
-    expect(result.report.evicted).toEqual([])
-  })
-
   it("keeps the memory block even when it overruns its ceiling", () => {
     const memories = `[MEM] progress: caught up to episode 500 (conf 0.9)\n${"z".repeat(1200)}`
     const result = assembleMessages(input({ memories, docs: [doc("entry:1")] }))

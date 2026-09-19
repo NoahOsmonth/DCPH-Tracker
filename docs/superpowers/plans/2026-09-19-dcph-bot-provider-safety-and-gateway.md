@@ -3226,13 +3226,15 @@ answer is now labelled rather than presented as complete."
 The route imports `@/utils/supabase/server` (cookie-bound) and `@/lib/chat/search` (live
 network). Both are mocked so the test is offline and deterministic.
 
-The two gateway stores are mocked for a different reason: the real
-`lib/ai/provider-health.ts`, `lib/ai/quota.ts` and `lib/ai/request-log.ts` all reach
-`createAdminClient()` → `@/lib/env`, which throws during module evaluation when
-`NEXT_PUBLIC_SUPABASE_URL` is unset — and CI has no `.env.local`. A `vi.mock` factory
-replaces the module before it is evaluated, so the import never happens. Both stores are
-covered properly by their own offline unit tests in Tasks 5 and 6; here they only have to
-be inert.
+The two gateway stores are mocked for isolation, not convenience. `vitest.config.mts`
+loads `.env.local`, so a real `SUPABASE_SERVICE_ROLE_KEY` is present on a developer
+machine: without these mocks the test would build a real service-role client and call
+`rate_limit_hit` and `ai_provider_state` against the live project — and the migration that
+creates those tables is deliberately not applied remotely yet (Task 4). A machine with no
+`.env.local` would instead throw at import, because `@/lib/env` calls `required()` at
+module scope. `vi.mock` replaces the module before it is evaluated, which removes both
+failure modes. Both stores are covered properly by their own offline unit tests in Tasks 5
+and 6; here they only have to be inert.
 
 ```ts
 // app/api/ai-chat/route.integration.test.ts

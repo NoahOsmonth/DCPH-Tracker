@@ -26,8 +26,9 @@ import { EXECUTE_BUDGET_MS, executePlan, mergeEvidence } from "@/lib/ai/pipeline
  * 2. Three of the plan's eight steps are never dispatched: the ladder's rounds
  *    are those tools over the whole corpus, and a drop must be recorded, not
  *    silently ignored.
- * 3. The merge is deterministic. `[E3]` has to mean the same document on a
- *    retry, so the order is a total order and origins are unioned, never lost.
+ * 3. The merge keeps the ladder's ranking. `[E3]` has to mean the same
+ *    document on a retry, so the order the merge hands the assembler is
+ *    deterministic, and origins are unioned, never lost.
  * 4. The stage is bounded and cannot throw: a budget expiry, a broken ladder, a
  *    throwing `runTools` and a source that rejects all return a report.
  *
@@ -437,10 +438,9 @@ describe("executePlan: the ladder's parameters", () => {
       toolCtx: toolCtx(),
     })
 
-    // Asserted at the module boundary on purpose: the scorer decides the
-    // ladder's own order, and the merge then re-sorts by rrf, so the flags'
-    // *effect* is the ladder's test to pin (retrieval-ladder.test.ts) and their
-    // *forwarding* is this one's.
+    // Asserted at the module boundary on purpose: the scorer owns the ladder's
+    // order and the merge keeps it, so the flags' *effect* is the ladder's test
+    // to pin (retrieval-ladder.test.ts) and their *forwarding* is this one's.
     expect(ladderSpy.mock.calls[0][0]).toMatchObject({
       query: "mountain lodge case",
       keywords: ["mountain", "lodge"],
@@ -514,41 +514,71 @@ describe("mergeEvidence", () => {
     expect(merged).toEqual([{ doc: HAIBARA_DOC, score: 0, rrf: 0, origins: ["tool"] }])
   })
 
-  it("orders by rrf desc, then score desc, then id asc", () => {
-    const best = entryDoc(1, "A")
-    const tieA = entryDoc(2, "B")
-    const tieB = entryDoc(3, "C")
-    const worst = entryDoc(4, "D")
+  it("keeps the ladder's ranked order verbatim, even when a later hit has a higher rrf", () => {
+    const first = entryDoc(1, "A")
+    const second = entryDoc(2, "B")
+    const third = entryDoc(3, "C")
 
     const merged = mergeEvidence({
       ladderDocs: [
-        scored(worst, 0.01, 99, ["fts"]),
-        scored(tieB, 0.02, 5, ["fts"]),
-        scored(tieA, 0.02, 5, ["entity"]),
-        scored(best, 0.04, 1, ["fts"]),
+        scored(first, 0.01, 99, ["fts"]),
+        scored(second, 0.04, 1, ["entity"]),
+        scored(third, 0.02, 5, ["fts"]),
       ],
       toolDocs: [],
     })
 
-    expect(merged.map((entry) => entry.doc.id)).toEqual([best.id, tieA.id, tieB.id, worst.id])
+    // The ladder's order is `rankCandidates`' verdict — fused first, scored
+    // second — so a later document's higher rrf or score must not promote it:
+    // re-sorting by rrf is what cost the golden eval 10 of its 60 cases.
+    expect(merged.map((entry) => entry.doc.id)).toEqual([first.id, second.id, third.id])
   })
 
-  it("is deterministic, order-independent and does not mutate its entries", () => {
+  it("appends the tool-only hits after the ladder's, in toolDocs order", () => {
+    const ranked = entryDoc(1, "Ranked")
+    const toolA = entryDoc(2, "Tool A")
+    const toolB = entryDoc(3, "Tool B")
+
+    const merged = mergeEvidence({
+      ladderDocs: [scored(ranked, 0.02, 9, ["fts"])],
+      // `ranked` was already there, so the tool hit only joins its origins and
+      // keeps the ladder's position; the two tool-only hits follow in the order
+      // their own array gives them.
+      toolDocs: [toolA, ranked, toolB],
+    })
+
+    expect(merged.map((entry) => entry.doc.id)).toEqual([ranked.id, toolA.id, toolB.id])
+    expect(merged[0].origins).toEqual(["fts", "tool"])
+    expect(merged[1]).toEqual({ doc: toolA, score: 0, rrf: 0, origins: ["tool"] })
+    expect(merged[2]).toEqual({ doc: toolB, score: 0, rrf: 0, origins: ["tool"] })
+  })
+
+  it("returns an empty merge when both gathers are empty", () => {
+    expect(mergeEvidence({ toolDocs: [], ladderDocs: [] })).toEqual([])
+  })
+
+  it("is deterministic, keeps each input's order and does not mutate its entries", () => {
     const docA = entryDoc(1, "A")
     const docB = entryDoc(2, "B")
     const entryA = scored(docA, 0.02, 3, ["fts"])
     const entryB = scored(docB, 0.01, 9, ["entity", "fts"])
 
     const one = mergeEvidence({ ladderDocs: [entryA, entryB], toolDocs: [HAIBARA_DOC, docA] })
-    const two = mergeEvidence({ ladderDocs: [entryB, entryA], toolDocs: [docA, HAIBARA_DOC] })
+    const two = mergeEvidence({ ladderDocs: [entryA, entryB], toolDocs: [HAIBARA_DOC, docA] })
 
-    // `[E3]` has to mean the same document on a retry: both the merged array and
-    // the origins inside it must compare deep-equal across runs.
+    // `[E3]` has to mean the same document on a retry: the same inputs must
+    // compare deep-equal, origins included.
     expect(two).toEqual(one)
     expect(one[0].origins).toEqual(["fts", "tool"])
     expect(one[1].origins).toEqual(["entity", "fts"])
     expect(entryA.origins).toEqual(["fts"])
     expect(entryB.origins).toEqual(["entity", "fts"])
+
+    // The ladder's order is the ranking, so a permuted ladder list is a
+    // different ranking; permuting `toolDocs` only permutes the appended tail,
+    // which is the one order-independence left to claim.
+    const swapped = mergeEvidence({ ladderDocs: [entryB, entryA], toolDocs: [docA, HAIBARA_DOC] })
+    expect(swapped.map((entry) => entry.doc.id)).toEqual([docB.id, docA.id, HAIBARA_DOC.id])
   })
 })
 

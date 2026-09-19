@@ -19,16 +19,17 @@
  *    `[E1]` always exists while any evidence survives, and no gap can be cited.
  * 2. **Budgets are enforced by eviction.** Tokens are `chars / 4` — the memory
  *    module's `CHARS_PER_TOKEN`, imported rather than re-declared so the two
- *    cannot disagree. Evidence is evicted lowest fused rank first (`rrf`, then
- *    `score`, then `id`, all ascending — a total order, so the same input
- *    always evicts the same documents); a wiki extract is rankless and carries
- *    `rrf: 0`, so it is the first evidence to go. Turns are trimmed oldest-first
- *    and the newest turn is kept whole even when it alone overruns the ceiling:
- *    dropping it would send a request with no question in it. Memory and the
- *    system prompt are never evicted — the first is cheap and load-bearing, the
- *    second is the contract. The rolling summary is evicted last, only when
- *    everything else is already gone. A document larger than the whole evidence
- *    ceiling is evicted, not truncated: the ceiling is a guarantee.
+ *    cannot disagree. Evidence is evicted from the tail of the rendered order:
+ *    `mergeEvidence` hands this module the ladder's ranking verbatim, so the
+ *    last-rendered document is the lowest-ranked one and it is the first to go
+ *    (a wiki extract renders after every document, so it goes before any of
+ *    them). Turns are trimmed oldest-first and the newest turn is kept whole
+ *    even when it alone overruns the ceiling: dropping it would send a request
+ *    with no question in it. Memory and the system prompt are never evicted —
+ *    the first is cheap and load-bearing, the second is the contract. The
+ *    rolling summary is evicted last, only when everything else is already
+ *    gone. A document larger than the whole evidence ceiling is evicted, not
+ *    truncated: the ceiling is a guarantee.
  * 3. **The stable prefix.** The system message begins with `input.systemPrompt`
  *    byte-for-byte and appends the dynamic sections after it, so two requests
  *    with different memory and evidence share a cacheable prefix up to the
@@ -47,9 +48,9 @@
  * wrapper put it there, or the caller skipped its stage.
  *
  * `report.evicted` is a string list, and its entries are three shapes, in this
- * order: the evicted document and wiki ids (in eviction order, lowest rank
- * first), then `<TURN_EVICTION_PREFIX><n>` when turns were trimmed, then
- * `SUMMARY_EVICTION` when the summary was dropped.
+ * order: the evicted document and wiki ids (in eviction order, from the tail of
+ * the rendered evidence), then `<TURN_EVICTION_PREFIX><n>` when turns were
+ * trimmed, then `SUMMARY_EVICTION` when the summary was dropped.
  *
  * Pure and synchronous, like the rest of the retrieval path, and it never
  * throws: an empty request is still a valid request, and an answer with no
@@ -124,7 +125,8 @@ export interface AssemblyInput {
   /** The window's turns, oldest first. The current user message is the caller's
    *  to append — the assembler renders the list it is given. */
   turns: PersistedTurn[]
-  /** Screened, merged documents: Task 6's order is the numbering order. */
+  /** Screened, merged documents: Task 6's order is the ranking, and so it is
+   *  the numbering order and the eviction order (the tail goes first). */
   docs: ScoredDoc[]
   wiki: WikiEvidence[]
 }
@@ -153,11 +155,6 @@ function asList<T>(value: T[] | null | undefined): T[] {
   return Array.isArray(value) ? value : []
 }
 
-/** A rank key. A missing or non-finite rank is 0, the lowest rank there is. */
-function asRank(value: unknown): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : 0
-}
-
 /**
  * A label is one line by construction: a title that carries a newline could
  * otherwise forge a second header, or a line that looks like a wrap marker, in
@@ -179,16 +176,14 @@ function tokenCost(text: string): number {
 /**
  * One document as the model will read it.
  *
- * `rrf` and `score` exist only for the eviction order; a wiki extract has
- * neither, which is why it carries the lowest rank and is evicted first.
+ * The block carries no rank: the rendered order *is* the ranking (the input
+ * order, kept verbatim from the merge), and eviction reads nothing else.
  */
 interface EvidenceBlock {
   id: string
   tag: EvidenceTag
   label: string
   body: string
-  rrf: number
-  score: number
 }
 
 interface RankedBlock {
@@ -210,8 +205,6 @@ function buildBlocks(input: AssemblyInput): EvidenceBlock[] {
       tag: document.source === "conversations" ? "[CONV]" : "[RET]",
       label: asLabel(document.title),
       body: asText(document.body),
-      rrf: asRank(entry.rrf),
-      score: asRank(entry.score),
     })
   }
 
@@ -225,8 +218,6 @@ function buildBlocks(input: AssemblyInput): EvidenceBlock[] {
       tag: "[WIKI]",
       label,
       body: asText(entry.extract),
-      rrf: 0,
-      score: 0,
     })
   }
 
@@ -244,15 +235,20 @@ function renderBlock(block: EvidenceBlock, n: number): string {
 }
 
 /**
- * Lowest fused rank first: rrf, then score, then id, all ascending. Eviction
- * takes the front of this order; rendering keeps the input order. The two are
- * deliberately not the same list — the first evicted document is the
- * lowest-ranked, not the last rendered.
+ * The tail of the rendered order first, and nothing else: eviction is the
+ * reverse of the input order.
+ *
+ * Rendering keeps the input order, and the input order is the ranking — the
+ * merge hands over the ladder's ranked list verbatim, with the tools' hits
+ * appended, so the scorer's verdict is that order rather than the `rrf`/`score`
+ * fields (and a tool-only block carries no rank at all). The first document
+ * evicted is therefore the lowest-*ranked* one: the tail of the ranked list,
+ * which is not necessarily the smallest `rrf`. Re-deriving the order from those
+ * numbers would evict an `[E1]`-numbered document while keeping the tail the
+ * merge deliberately ranked below it.
  */
 function compareEviction(a: RankedBlock, b: RankedBlock): number {
-  if (a.block.rrf !== b.block.rrf) return a.block.rrf - b.block.rrf
-  if (a.block.score !== b.block.score) return a.block.score - b.block.score
-  return a.block.id < b.block.id ? -1 : a.block.id > b.block.id ? 1 : 0
+  return b.index - a.index
 }
 
 /* ------------------------------------------------------------------ */

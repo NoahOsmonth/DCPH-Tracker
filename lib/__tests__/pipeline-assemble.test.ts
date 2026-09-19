@@ -303,17 +303,19 @@ describe("assembleMessages budgets and eviction", () => {
     expect(systemOf(result)).not.toContain(oversized.slice(0, 100))
   })
 
-  it("breaks an evidence eviction tie on score, then id", () => {
+  it("evicts the tail of the ranked list, not the smallest rrf", () => {
     const docs = [
-      doc("b", { rrf: 1, score: 5, body: HUGE }),
-      doc("c", { rrf: 1, score: 9, body: HUGE }),
-      doc("a", { rrf: 1, score: 5, body: HUGE }),
+      doc("head", { rrf: 1, score: 1, body: HUGE }),
+      doc("middle", { rrf: 5, score: 5, body: HUGE }),
+      doc("tail", { rrf: 9, score: 9, body: HUGE }),
     ]
     const result = assembleMessages(input({ docs }))
 
-    // "a" is the lowest id among the equally scored; "b" keeps its place.
-    expect(result.report.evicted).toEqual(["a"])
-    expect(result.report.evidence.map((ref) => ref.id)).toEqual(["b", "c"])
+    // The rendered order is the ranking, so the last document goes first even
+    // though its rrf and score are the highest of the three: eviction reads no
+    // rank numbers, it takes the tail.
+    expect(result.report.evicted).toEqual(["tail"])
+    expect(result.report.evidence.map((ref) => ref.id)).toEqual(["head", "middle"])
   })
 
   it("breaks an equal-rrf tie on the lower score first", () => {
@@ -330,7 +332,7 @@ describe("assembleMessages budgets and eviction", () => {
     expect(result.report.evicted).toEqual(["low"])
   })
 
-  it("evicts an unranked wiki extract before a ranked document", () => {
+  it("evicts a trailing wiki extract before the documents", () => {
     const result = assembleMessages(
       input({
         docs: [doc("entry:1", { rrf: 1, title: "Episode 1", body: "x".repeat(3600) })],
@@ -338,6 +340,8 @@ describe("assembleMessages budgets and eviction", () => {
       })
     )
 
+    // Wiki blocks render after every document, so the extract is the tail of
+    // the rendered order and the first evidence the budget drops.
     expect(result.report.evidence.map((ref) => ref.id)).toEqual(["entry:1"])
     expect(result.report.evicted).toEqual(["wiki:dcw:Ai Haibara"])
     expect(systemOf(result)).not.toContain("y".repeat(100))

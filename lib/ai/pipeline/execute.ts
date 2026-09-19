@@ -11,9 +11,13 @@
  *    `search_cases` and `wiki_lookup` are the ladder's own branches scoped to one
  *    namespace, so dispatching them too would fetch the same documents twice and
  *    pay twice for it. They are dropped, and the drop is recorded in `dropped`.
- * 3. **The merge is a total order** (rrf desc, score desc, id asc), because the
- *    assembler numbers the evidence and `[E3]` has to mean the same document on
- *    a retry.
+ * 3. **The merge keeps the ladder's ranking, it does not re-sort.** `runLadder`
+ *    returns `rankCandidates`' order — fuse first, score second, so the scorer's
+ *    verdict is already in it — and the merge preserves that order verbatim,
+ *    appending the tools' precise hits after it. Re-sorting by `rrf` throws the
+ *    verdict away: the golden pipeline eval measured 60/60 → 50/60 recall@5
+ *    when the merge did it. The order is still total and deterministic, which
+ *    is what makes `[E#]` mean the same document on a retry.
  * 4. **The stage is bounded and cannot throw.** An expiring budget returns what
  *    has arrived; a gather that breaks outright is a flag in the report. A throw
  *    here is a 500 on a question the other gather could still answer.
@@ -285,14 +289,23 @@ function degradeReason(input: {
 /**
  * Merges the two gathers by document id.
  *
- * A document both found is one document: the ladder's entry is the base (its
- * `rrf` is what the assembler's eviction order and the numbering read), and the
- * tool's provenance is unioned into its origins rather than replacing them. A
- * document only a tool found is a precise hit, not a ranked candidate: it keeps
- * `rrf: 0` and `score: 0` — no gather ranked it — and `origins: ["tool"]`.
+ * A document both found is one document: the ladder's entry is the base — its
+ * position, score and rrf are the ranking's, and the tool only joins its
+ * origins — and a document only a tool found is a precise hit, not a ranked
+ * candidate: it keeps `rrf: 0` and `score: 0` — no gather ranked it — and
+ * `origins: ["tool"]`.
  *
- * The sort is the total order rrf desc, score desc, id asc. Pure: neither input
- * array nor any entry is mutated.
+ * The ladder's order is kept verbatim, because it *is* the ranking:
+ * `runLadder` returns `rankCandidates`' order, which deliberately fuses first
+ * and scores second so the scorer's verdict is the final order. The map
+ * preserves insertion order, so that is simply not destroying it with a sort.
+ * Re-sorting by `rrf` here discarded the verdict — the golden pipeline eval
+ * fell from 60/60 to 50/60 recall@5 while the merge did it — and the assembler
+ * reads the same order as the rank, evicting from its tail.
+ *
+ * Tool-only documents come after every ladder document, in the order
+ * `toolDocs` gives them: they are appendages to the ranking, not part of it.
+ * Pure: neither input array nor any entry is mutated.
  */
 export function mergeEvidence(input: {
   toolDocs: CorpusDocument[]
@@ -314,9 +327,5 @@ export function mergeEvidence(input: {
     merged.set(doc.id, { doc, score: 0, rrf: 0, origins: [TOOL_ORIGIN] })
   }
 
-  return [...merged.values()].sort((left, right) => {
-    if (right.rrf !== left.rrf) return right.rrf - left.rrf
-    if (right.score !== left.score) return right.score - left.score
-    return left.doc.id < right.doc.id ? -1 : left.doc.id > right.doc.id ? 1 : 0
-  })
+  return [...merged.values()]
 }

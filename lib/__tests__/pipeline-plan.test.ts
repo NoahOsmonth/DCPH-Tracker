@@ -80,13 +80,12 @@ describe("PlanStepSchema", () => {
     expect(variantNames).toEqual([...PLAN_TOOLS])
   })
 
-  it("covers every registered tool: TOOL_NAMES is a subset of PLAN_TOOLS", () => {
-    // One-directional on purpose: `search_conversations` is planned before the
-    // tool that dispatches it exists (Task 5), while a new registry entry without
-    // a plan variant must fail here.
+  it("covers every registered tool, and plans nothing the registry cannot dispatch", () => {
+    // Both directions: a registry entry without a plan variant would be a tool no
+    // plan can ever call, and a plan variant without a registry entry would be a
+    // step `runTools` fails at dispatch time.
     for (const name of TOOL_NAMES) expect(PLAN_TOOLS, name).toContain(name)
-    expect(PLAN_TOOLS).toContain("search_conversations")
-    expect([...TOOL_NAMES]).not.toContain("search_conversations")
+    for (const name of PLAN_TOOLS) expect([...TOOL_NAMES], name).toContain(name)
   })
 
   it("parses every variant with and without its optional arguments", () => {

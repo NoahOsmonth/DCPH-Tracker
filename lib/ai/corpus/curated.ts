@@ -202,11 +202,25 @@ export function buildRelationshipDocs(
   return docs
 }
 
+/**
+ * An arc's episode range is a real alternate name for it ("the 179-345
+ * stretch"), and R1's alias branch is the only rule that can match a number a
+ * document does not own as its own `episode_number` -- an arc is not an episode.
+ * Without these, "which arc covers episodes 179 to 345" is decided by the id
+ * tie-break between seven arcs that all matched the word "arc".
+ */
+function arcAliases(arc: StoryArc): string[] {
+  return [arc.episodeStart, arc.episodeEnd]
+    .filter((value): value is number => value !== null)
+    .map((value) => String(value))
+}
+
 export function buildArcDocs(arcs: StoryArc[] = STORY_ARCS): CorpusDocument[] {
   return arcs.map((arc): CorpusDocument => ({
     id: `arc:${arc.slug}`,
     source: "arcs",
     title: arc.title,
+    aliases: arcAliases(arc),
     body: joinLines([
       arc.tagline,
       `${arc.era} — ${arc.years} — ${arc.status}`,

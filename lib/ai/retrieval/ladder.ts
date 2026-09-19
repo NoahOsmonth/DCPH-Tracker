@@ -35,11 +35,22 @@ export const EVIDENCE_THRESHOLD = 6
 /** Wall-clock budget for the whole ladder, R1 through R4. */
 export const LADDER_BUDGET_MS = 1500
 
-/** R2's pool. Full text is the recall workhorse, so it gets the largest one. */
+/** R2's pool. Full text is the recall workhorse, so its pool stays large. */
 export const LADDER_CANDIDATES = 80
 
-/** R1's pool. An entity hit is near-certain, so 20 is plenty. */
-export const ENTITY_CANDIDATES = 20
+/**
+ * R1's pool.
+ *
+ * This was 20, on the theory that an entity hit is near-certain. The golden eval
+ * (lib/__tests__/retrieval-eval.test.ts) showed the flaw: the weakest entity
+ * rule (title substring, rank 1.0) matches a short keyword anywhere in a title
+ * -- "ran" inside "strange" -- so that whole tier ties at 1.0 and is ordered by
+ * id, and it can run past a hundred rows. A document whose title contains two
+ * of the query's names then sits behind that noise, and at 20 slots it never
+ * reached the scorer that would have ranked it first. 100 reaches it without
+ * making the RPC's `limit` the whole table.
+ */
+export const ENTITY_CANDIDATES = 100
 
 /** R3's pool. Trigram similarity is the noisiest branch, so it stays small. */
 export const FUZZY_CANDIDATES = 40

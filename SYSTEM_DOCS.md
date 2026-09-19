@@ -112,6 +112,10 @@
 | `notifications` | User notifications |
 | `sync_staging` | Admin approval queue for synced content |
 | `screening_events` | Movie screening event listings |
+| `ai_provider_state` | Cross-instance circuit-breaker state per gateway target |
+| `ai_request_log` | One row per AI chat request (target, outcome, timings) |
+| `ai_documents` | Retrieval corpus: one searchable row per catalog/curated document |
+| `ai_wiki_cache` | Time-boxed cache of DCW / Wikipedia extracts |
 
 ### SQL Views
 - `all_episodes_with_crimes` — Joins `content_entries` with `dcw_cases`
@@ -125,6 +129,14 @@
 - `migration-episode-comments.sql` — episode comment threads and policies
 - `migration-leaderboard-rls.sql` — row-level security for leaderboard reads
 - `migration-enforce-bans.sql` — enforces account bans at the database layer
+- `migrations/20260919090000_ai_gateway_infra.sql` — `ai_provider_state` + `ai_request_log`
+- `migrations/20260919100000_ai_corpus.sql` — `pg_trgm`, `ai_documents`, `ai_wiki_cache`, and the three retrieval RPCs
+
+> **Not applied remotely.** The two `20260919*` migrations are committed but have **not** been
+> run against the linked Supabase project. Applying them is a deliberate manual step (`supabase db
+> push`, or pasting the files into the SQL editor); no test executes the SQL, because CI has no
+> Postgres. Until they are applied, `/api/admin/ingest-corpus` fails with a Postgres error and
+> the retrieval ladder has no documents to read.
 
 ---
 
@@ -141,34 +153,44 @@
   - Image fetching — `lib/dcw-image-for-title.ts`
   - Chatbot search — `lib/chat/search.ts`
 
+Per-target budgets, models and timeouts live in `lib/ai/targets.ts` (budgets),
+`lib/ai/circuit.ts` (cooldowns) and `lib/ai/gateway.ts` (timeouts); this section is a summary.
+
 ### 2. Google AI Studio (Gemini API)
 - **URL**: `https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`
 - **Type**: OpenAI-compatible Google Gemini API
-- **Models**: `gemini-3.5-flash-lite` (500 req/day), `gemini-3.1-flash-lite` (500 req/day), `gemini-3.6-flash`
+- **Models**: `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`, `gemini-3.6-flash`, `gemini-3-flash` (1400 req/day each)
 - **Role**: Primary intelligence tier in AI chatbot fallback chain
 
 ### 3. Groq Cloud API
 - **URL**: `https://api.groq.com/openai/v1/chat/completions`
 - **Type**: OpenAI-compatible ultra-fast LPU inference
-- **Models**: `openai/gpt-oss-120b`, `qwen/qwen3.8-27b`, `qwen/qwen3.6-27b`, `openai/gpt-oss-20b`, `groq/compound`
-- **Role**: Secondary high-volume tier (~11,500 free req/day)
+- **Models**: `openai/gpt-oss-120b`, `qwen/qwen3.8-27b`, `qwen/qwen3.6-27b`, `openai/gpt-oss-20b`, `groq/compound` (14,000 req/day each)
+- **Role**: Secondary high-volume tier
 
 ### 4. OpenRouter API
 - **URL**: `https://openrouter.ai/api/v1/chat/completions`
 - **Type**: Multi-model aggregator
+- **Models**: `minimax/minimax-m3:free`, `minimax/minimax-m2.7:free`, `google/gemma-4-31b-it:free`, `z-ai/glm-5.2:free`, `nvidia/nemotron-3.5-lightning:free`, `inclusionai/ling-3.0-flash-fin:free` (50 req/day per key)
 - **Role**: Tertiary backup tier with primary + secondary key failover
 
-### 5. Jikan API (MyAnimeList)
+### 5. Cerebras API
+- **URL**: `https://api.cerebras.ai/v1/chat/completions`
+- **Type**: OpenAI-compatible inference (constrained-decoding JSON schema support)
+- **Models**: `gpt-oss-120b`, `gemma-4-31b` (900 req/day each)
+- **Role**: Final fallback tier
+
+### 6. Jikan API (MyAnimeList)
 - **URL**: `https://api.jikan.moe/v4`
 - **Type**: Free MAL API wrapper
 - **Usage**: Fetches episode lists, anime details for content sync
 
-### 6. Kitsu API
+### 7. Kitsu API
 - **URL**: `https://kitsu.io/api/edge`
 - **Type**: Free anime database API
 - **Usage**: Franchise entry data (movies, specials, OVAs) for content sync
 
-### 7. AniList API
+### 8. AniList API
 - **URL**: `https://graphql.anilist.co`
 - **Type**: GraphQL API
 - **Usage**: Airing schedule data for content sync
@@ -208,6 +230,65 @@ User question (Signed-in member)
 6. **Rich Interactive Tracker Links**: Episode/case links are styled as interactive badges linking to `https://dcphtracker.vercel.app/tracker/...`.
 7. **Reasoning Kept Out of the Answer**: a provider's reasoning channel (`reasoning_content` / `reasoning`, sent by Groq and OpenRouter) is parsed separately from the answer text by `lib/ai/sse.ts` and is never stitched into the streamed reply. Reasoning delivered inline in `content` is no longer filtered on the streaming path — `lib/chat/answer.ts` retains those helpers for that case, but `/api/ai-chat` no longer wires the streaming `ThinkingFilter` in.
 8. **Request Log**: every chat request writes one `ai_request_log` row with the target used, the outcome, the per-target attempt list, and retrieval / time-to-first-token / total timings, so provider health and latency are measurable.
+
+### AI Retrieval Corpus
+
+The corpus is `ai_documents` — one row per retrievable document, ids namespaced by source
+(`entry:<slug>`, `character:<id>`, `relationship:<id>`, `arc:<slug>`, `thread:<slug>`,
+`guide:canon`, `movie:<n>`, `gadget:<n>`, `case:<page_title>#<index>`) — with a generated `fts`
+column (title weight A, body weight B), a trigram index on `title`, a GIN index on `aliases`,
+and `episode_number` / `movie_number` as first-class columns. `ai_wiki_cache` holds time-boxed
+DCW / Wikipedia extracts (7-day TTL, 1.2 s time box per fetch) so a wiki lookup cannot stall a
+chat request. Both tables are service-role only: RLS on, no policies.
+
+Three RPCs, one per retrieval branch:
+
+| RPC | Branch | What it matches |
+|-----|--------|-----------------|
+| `ai_docs_entity` | R1, entity-precise | episode/movie number (rank 3.0), exact title (2.0), alias overlap (1.5), title substring (1.0) |
+| `ai_docs_fts` | R2, full text | `websearch_to_tsquery('english', query)` over `title \|\| body` — token AND, and a malformed query yields an empty tsquery that matches nothing instead of raising |
+| `ai_docs_fuzzy` | R3, typo tolerance | `similarity()` on `title` against the query and each keyword ≥ 3 characters, `pg_trgm` threshold 0.3 |
+
+`lib/ai/retrieval/ladder.ts` runs them cheapest-first: R1 and R2 together, R3 only while fewer
+than **6** distinct candidates are fused, R4 (wiki) only when the question needs lore and the
+budget allows. The ladder has a **1.5 s** wall-clock budget; a round skipped for time is
+recorded in `steps` and sets `degraded: "retrieval_budget"` on the result, so a thin answer is
+labelled rather than silently degraded. Candidate lists are fused with reciprocal rank fusion
+(`lib/ai/retrieval/rrf.ts`) and re-ranked by the tracker scorer
+(`lib/ai/retrieval/candidates.ts`); a branch that rejects degrades to an empty result, never to
+a failed request.
+
+**Ingestion**: `POST /api/admin/ingest-corpus` rebuilds the corpus from `content_entries`,
+`dcw_cases` and the curated guides, hashing each document and upserting only what changed.
+Auth is the `x-admin-secret` header matching `ADMIN_TASK_SECRET || CRON_SECRET`; `?dryRun=1`
+computes the report without writing, and the route caps at `maxDuration = 300`. With the dev
+server running:
+
+```bash
+curl -X POST "http://localhost:3000/api/admin/ingest-corpus?dryRun=1" \
+  -H "x-admin-secret: $ADMIN_TASK_SECRET"
+```
+
+**Golden eval**: `lib/__tests__/retrieval-eval.test.ts` runs 60 hand-authored questions
+(`lib/__tests__/fixtures/golden-qa.json`) through the real ladder over an in-process index of
+the seed catalog and the curated guides, and gates at **recall@5 ≥ 0.85**. That number is an
+offline approximation (plan deviation D5): `createStaticSource` implements the same three
+branches as the RPCs but not Postgres's exact ranking or stemming, and `dcw_cases` has no
+offline source, so case retrieval is not covered. It measures the pipeline — ladder, fusion,
+scorer — not the SQL.
+
+**Manual verification**, after applying `20260919100000_ai_corpus.sql`:
+
+```sql
+-- The migration's first statement needs this schema to exist; Supabase creates it,
+-- but check before running the file if the project was ever rebuilt by hand.
+select 1 from pg_namespace where nspname = 'extensions';
+
+select count(*) from public.ai_documents;
+select id, rank from public.ai_docs_entity(array[500], array['haibara'], 5);
+select id, rank from public.ai_docs_fts('ski lodge murder', 5);
+select id, rank from public.ai_docs_fuzzy('haibarra', array['haibarra'], 5);
+```
 
 ---
 

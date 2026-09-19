@@ -3678,11 +3678,12 @@ Replace the file's top doc comment's first paragraph with one that records curre
 
 ```bash
 grep -n "GEMINI_API_KEY" .env.example SYSTEM_DOCS.md
-grep -n "openrouter/free" SYSTEM_DOCS.md lib/ai/targets.ts
+grep -n "openrouter/free" SYSTEM_DOCS.md
 ```
-Expected: the first prints matches in both files; the second prints **no** match in either —
-if `openrouter/free` appears anywhere except the explaining comment in `lib/ai/targets.ts`, a
-doc still describes removed behaviour.
+Expected: the first prints matches in both files. The second prints nothing — `openrouter/free`
+survives only as the explanatory comment in `lib/ai/targets.ts` recording why the model was
+removed, and a document that still lists it would be describing behaviour that no longer
+exists.
 
 - [ ] **Step 5: Full verification**
 

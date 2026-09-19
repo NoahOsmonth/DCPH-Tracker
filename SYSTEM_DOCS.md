@@ -187,10 +187,14 @@ User question (Signed-in member)
       → Tracker DB search (content_entries + dcw_cases)
       → User watch history & profile (if signed in)
       → Build system prompt (Tagalog/English natural tone + structured episode cards)
-      → Multi-provider fallback stream:
-          1. Google Gemini Flash Lite
-          2. Groq Cloud LPU
-          3. OpenRouter Free Models
+      → Model gateway (lib/ai/gateway.ts) — targets tried in that order:
+          Google Gemini (AI Studio) → Groq Cloud → OpenRouter (:free) → Cerebras
+          Circuit state and daily budget are checked per target before a request
+          is spent. Failures are classified (misconfigured / rate_limited /
+          server_error / timeout / network / empty_output) and a misconfigured
+          target is cooled down for 24h rather than retried on every request.
+          Failover stops once text has started streaming, so a partial answer is
+          kept and labelled instead of being stitched to another model's reply.
       → Stream plain text response back
     → ChatWidget renders streaming markdown
 ```
@@ -202,7 +206,8 @@ User question (Signed-in member)
 4. **Voice Input (Speech-to-Text)**: Native browser Web Speech API microphone button with audio recording animation.
 5. **One-Click Message Copying**: Copy button with checkmark feedback under bot messages.
 6. **Rich Interactive Tracker Links**: Episode/case links are styled as interactive badges linking to `https://dcphtracker.vercel.app/tracker/...`.
-7. **Thinking Filter**: Strips reasoning/`<think>` blocks and internal thoughts during streaming.
+7. **Reasoning Kept Out of the Answer**: a provider's reasoning channel (`reasoning_content` / `reasoning`, sent by Groq and OpenRouter) is parsed separately from the answer text by `lib/ai/sse.ts` and is never stitched into the streamed reply. Reasoning delivered inline in `content` is no longer filtered on the streaming path — `lib/chat/answer.ts` retains those helpers for that case, but `/api/ai-chat` no longer wires the streaming `ThinkingFilter` in.
+8. **Request Log**: every chat request writes one `ai_request_log` row with the target used, the outcome, the per-target attempt list, and retrieval / time-to-first-token / total timings, so provider health and latency are measurable.
 
 ---
 
@@ -231,15 +236,16 @@ NEXT_PUBLIC_SITE_URL=https://dcphtracker.vercel.app
 
 # Cron sync
 CRON_SECRET=...
-ADMIN_TASK_SECRET=dcph123
+ADMIN_TASK_SECRET=
 
-# AI Chatbot Providers
-GEMINI_API_KEY=AQ.Ab...
-GROQ_API_KEY=gsk_...
-OPENROUTER_API_KEY=sk-or-v1-...
-OPENROUTER_API_KEY_2=sk-or-v1-...
-CEREBRAS_API_KEY=csk-...
-CLOUDFLARE_API_TOKEN=cfut_...
+# AI Chatbot providers — see .env.example for the full annotated list.
+# All optional free tiers; at least one is required or /api/ai-chat returns 500.
+# Server-only: never prefix these with NEXT_PUBLIC_ (they would ship to the browser).
+GEMINI_API_KEY=
+GROQ_API_KEY=
+OPENROUTER_API_KEY=
+OPENROUTER_API_KEY_2=
+CEREBRAS_API_KEY=
 ```
 
 ---

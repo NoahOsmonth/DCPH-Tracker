@@ -71,12 +71,15 @@ user can delete it, and none of that work happens on the response's critical pat
 13. **`components/chat/ChatWidget.tsx` is read-only.** The user has it in flight. The phase
     must therefore be **backward compatible**: the old `{ message, history }` body keeps
     working, and the new conversation id is additive.
-14. **The response path must not get slower.** Nothing in this plan may add a database round
-    trip to the path between "request parsed" and "first token" except the two bounded reads
-    in Task 12 (conversation resolution and the L1 window), each of which is wrapped so a
-    failure degrades to the client-history path. Everything else — transcript writes,
-    summarisation, memory extraction and consolidation — runs in `after()`, after the
-    response has been handed to the client.
+14. **The response path must not get slower.** Nothing in this plan may add unbounded work to
+    the path between "request parsed" and "first token". That path gains four bounded reads —
+    conversation resolution, the ownership-checked user-turn append, the L1 window, and the
+    active-facts read — each a single indexed query or a `limit 8` select, each wrapped in the
+    400 ms timeout from Task 12 rule 7, and each degrading to today's client-history path on
+    failure or timeout. Measured against a 2–4 s first token, that is noise; unbounded, it is
+    not, which is why the timeout exists. Everything else — the assistant turn, summary
+    regeneration, memory extraction and consolidation — runs in `after()`, after the response
+    has been handed to the client.
 15. **Memory is not authoritative.** The prompt states that the tracker and the corpus
     outrank memory. A remembered fact never overrides retrieved ground truth, and this is
     asserted by a prompt test, not merely intended.
@@ -119,12 +122,12 @@ Same as Plan 2, which worked:
 | 4 | Rolling summary | `lib/ai/conversations/summary.ts`, test | `feat(ai): roll conversation summaries forward` |
 | 5 | Non-streaming structured model call | `lib/ai/gateway.ts`, `lib/ai/structured-call.ts`, tests | `feat(ai): add a non-streaming structured call to the gateway` |
 | 6 | Memory slots and extraction | `lib/ai/memory/slots.ts`, `lib/ai/memory/extract.ts`, test | `feat(ai): extract memory candidates from a turn` |
-| 7 | Consolidation | `lib/ai/memory/consolidate.ts`, test | `feat(ai): consolidate memory candidates into slots` |
-| 8 | Memory port and store | `lib/ai/memory/port.ts`, `lib/ai/memory/supabase-port.ts`, `lib/ai/memory/store.ts`, test | `feat(ai): add the memory store` |
+| 7 | Consolidation (+ the memory port types) | `lib/ai/memory/port.ts`, `lib/ai/memory/consolidate.ts`, test | `feat(ai): consolidate memory candidates into slots` |
+| 8 | Memory store, its adapter, and the supersede function | `supabase/migrations/20260919120000_ai_memory_supersede.sql`, `lib/ai/memory/supabase-port.ts`, `lib/ai/memory/store.ts`, test | `feat(ai): add the memory store` |
 | 9 | Decay scoring and selection | `lib/ai/memory/score.ts`, test | `feat(ai): score memories by relevance, confidence and decay` |
 | 10 | The async writer | `lib/ai/memory/write.ts`, test | `feat(ai): write memory asynchronously every fourth turn` |
 | 11 | Prompt: the memory section | `lib/chat/prompt.ts`, `lib/__tests__/chat-prompt.test.ts` (additive) | `feat(chat): inject remembered facts into the system prompt` |
-| 12 | Route integration and the backward-compatible contract | `app/api/ai-chat/route.ts`, `app/api/ai-chat/route.memory.test.ts` | `feat(chat): own the transcript server-side` |
+| 12 | Route integration and the backward-compatible contract | `lib/chat/persistence.ts`, `app/api/ai-chat/route.ts`, two new test files, one added `vi.mock` in the existing integration test | `feat(chat): own the transcript server-side` |
 | 13 | Memory API and the recall branch | `app/api/ai-chat/memory/route.ts`, `lib/ai/memory/recall.ts`, tests | `feat(chat): expose and answer the user's memories` |
 | 14 | Conversation API | `app/api/ai-chat/conversations/route.ts`, test | `feat(chat): expose the user's conversations` |
 | 15 | Documentation | `SYSTEM_DOCS.md`, `.env.example` | `docs(ai): document transcripts, memory and the kill switch` |
@@ -258,8 +261,13 @@ IMMUTABLE. Plan 2 learned this the hard way; the same assertion pattern applies 
 4. Every `check` constraint is present: `role in ('user','assistant','system')`,
    `kind in (...)`, `status in ('active','superseded','expired')`, `confidence >= 0 and
    confidence <= 1`, `feedback in ('up','down')`.
-5. `on delete cascade` on both `user_id` and `conversation_id`; `on delete set null` on
-   `superseded_by` and `source_message_id`; all five `references auth.users`.
+5. Five `references` clauses in total, and exactly **two** of them point at `auth.users`
+   (the two `user_id` columns, both `on delete cascade`); the other three point at
+   `ai_conversations`, `ai_user_memories` and `ai_messages`, with `on delete cascade` on
+   `conversation_id` and `on delete set null` on `superseded_by` and `source_message_id`.
+   *(Corrected after execution: the first draft said "all five `references auth.users`",
+   which contradicts this task's own SQL. The executing agent resolved it from the SQL and
+   reported the contradiction; three cross-table references cannot point at `auth.users`.)*
 6. The `ai_messages` fts column is `generated always as` and contains exactly one
    `'english'::regconfig`.
 7. No destructive statement: the file contains no `drop `, `truncate`, `delete from`,
@@ -626,7 +634,13 @@ Rules the tests pin:
 
 ### Task 7 — Consolidation
 
-**Files:** `lib/ai/memory/consolidate.ts`, `lib/__tests__/memory-consolidate.test.ts`
+**Files:** `lib/ai/memory/port.ts`, `lib/ai/memory/consolidate.ts`,
+`lib/__tests__/memory-consolidate.test.ts`
+
+*(Task order corrected during execution: this task declares the `MemoryPort` interface it
+depends on, because Task 8 cannot run first — Task 8's store implements this task's port. The
+original draft put `port.ts` in Task 8, which made Task 7 unexecutable as written. The split
+now mirrors Task 2, where the conversations port was declared before its consumers.)*
 
 Pure decision first, then the IO that applies it.
 
@@ -678,10 +692,16 @@ Rules:
 
 ---
 
-### Task 8 — Memory port and store
+### Task 8 — Memory store and its Supabase adapter
 
-**Files:** `lib/ai/memory/port.ts`, `lib/ai/memory/supabase-port.ts`, `lib/ai/memory/store.ts`,
+**Files:** `supabase/migrations/20260919120000_ai_memory_supersede.sql`,
+`lib/ai/memory/supabase-port.ts`, `lib/ai/memory/store.ts`,
 `lib/__tests__/memory-store.test.ts`
+
+*(Plan bug found at execution time and fixed here: rule 3's original "two writes, ordered
+insert-then-mark" cannot work against the partial unique index this plan itself defines — the
+insert is rejected while the original row is still active. The atomic function above replaces
+it. Task 7's `port.ts` interface is unchanged; only the adapter's implementation differs.)*
 
 ```ts
 // port.ts
@@ -727,10 +747,50 @@ Rules the tests pin:
 2. `loadActive` filters out `expires_at !== null && expires_at <= now` in addition to
    `status === "active"`, so an expired progress fact cannot reach the prompt even if the
    status was never flipped.
-3. `supersede` inserts the replacement and marks the old row in one port call (the adapter
-   does two writes, ordered insert-then-mark, so a crash between them leaves an active
-   replacement and an active original, which the unique index rejects loudly rather than
-   silently losing a fact).
+3. `supersede` replaces one active slot with a new fact through a **single atomic database
+   function**, `public.ai_memory_supersede`, added by this task's migration. The
+   insert-then-mark order the first draft specified is **impossible**: the partial unique
+   index `(user_id, kind, key) where status = 'active'` rejects the insert while the original
+   is still active, and marking the original first cannot set `superseded_by` because the
+   replacement's id does not exist yet. The function does all three steps in one transaction
+   — mark the original superseded (refusing when it is not this user's active row), insert
+   the replacement, then point `superseded_by` at it — and returns the new row.
+
+   ```sql
+   create or replace function public.ai_memory_supersede(
+     p_user_id uuid, p_old_id uuid, p_kind text, p_key text, p_value text,
+     p_confidence real, p_source_message_id uuid, p_expires_at timestamptz
+   ) returns public.ai_user_memories
+   language plpgsql volatile
+   set search_path = public, extensions, pg_temp as $$
+   declare v_new public.ai_user_memories;
+   begin
+     update public.ai_user_memories
+        set status = 'superseded', updated_at = now()
+      where id = p_old_id and user_id = p_user_id and status = 'active';
+     if not found then
+       raise exception 'memory % is not an active fact of this user', p_old_id;
+     end if;
+     insert into public.ai_user_memories
+       (user_id, kind, key, value, confidence, status, source_message_id, expires_at, last_confirmed_at)
+     values (p_user_id, p_kind, p_key, p_value, p_confidence, 'active', p_source_message_id, p_expires_at, now())
+     returning * into v_new;
+     update public.ai_user_memories
+        set superseded_by = v_new.id, updated_at = now()
+      where id = p_old_id and user_id = p_user_id;
+     return v_new;
+   end; $$;
+
+   revoke all on function public.ai_memory_supersede(uuid, uuid, text, text, text, real, uuid, timestamptz)
+     from anon, authenticated;
+   ```
+
+   The function is `security invoker` (the default), so the caller's own privileges decide;
+   `service_role` is the only role that can reach it in practice. `revoke ... from anon,
+   authenticated` mirrors the table pattern and leaves `PUBLIC`'s default `EXECUTE` alone so
+   `service_role` keeps its path. The migration is additive and gets its structural
+   assertions (function exists, `volatile`, `set search_path`, the ownership predicate inside
+   the `update`, the `revoke` line, no destructive statement) in this task's test file.
 4. `delete` returns `false` for an empty result set and never throws.
 5. `list` returns active rows first, then superseded, each newest-first, capped by `limit`
    (default 50) — this is the transparency endpoint's payload.
@@ -877,7 +937,9 @@ Rules:
 
 ### Task 12 — Route integration, backward compatible
 
-**Files:** `app/api/ai-chat/route.ts`, `app/api/ai-chat/route.memory.test.ts`
+**Files:** `lib/chat/persistence.ts` (new), `lib/__tests__/chat-persistence.test.ts` (new),
+`app/api/ai-chat/route.ts` (modified), `app/api/ai-chat/route.memory.test.ts` (new),
+`app/api/ai-chat/route.integration.test.ts` (one added `vi.mock`, nothing else)
 
 The riskiest task in the plan, so its constraints are explicit.
 
@@ -907,14 +969,29 @@ The riskiest task in the plan, so its constraints are explicit.
    emitted a non-empty, non-refusal answer.
 5. `after()` work is: append assistant turn → `createMemoryWriter().run({ … })`. Both are
    wrapped so a throw is logged, never surfaced (the response is already sent).
-6. The existing `app/api/ai-chat/route.integration.test.ts` is **not modified** and stays
-   green. That is the backward-compatibility proof, and it is a completion criterion.
-7. The two bounded reads added to the pre-stream path (resolve + window/memory) each have a
-   hard timeout of 400 ms and degrade to the legacy path on timeout. Assert the timeout path
-   with fake timers.
+6. The existing `app/api/ai-chat/route.integration.test.ts` is **additions only** (rule 7
+   above): one `vi.mock` for the persistence seam, zero changed assertions.
+7. The bounded reads added to the pre-stream path — `createRequestPersistence`, its
+   `window()`, its `memories()`, and the user-turn `record()` — each have a hard timeout of
+   400 ms and degrade to the legacy path on timeout. Assert the timeout path with fake timers.
+8. `scheduleAfter(work)` registers the post-response work with `next/server`'s `after` inside
+   a `try`, and on a throw (no request scope — unit tests, or any non-Next caller) falls back
+   to `void work()`. Either way the work runs exactly once.
+9. **One seam for all of it:** `lib/chat/persistence.ts` exports
+   `createRequestPersistence({ userId, conversationId, now? }): Promise<RequestPersistence | null>`,
+   which builds the admin client, the ports and the stores, and returns `null` when
+   `createAdminClient()` yields nothing. `RequestPersistence` exposes exactly four things to
+   the route — `conversationId`, `window()`, `memories(query)`, `record(role, content)`, and
+   `afterTurn({ answer })` — and owns the `AI_MEMORY` flag internally: `memories()` returns
+   `""` and `afterTurn` skips the memory writer when it is off, while the transcript still
+   records. The route therefore holds one `await`, one `try`, and one timed-out call per
+   step; everything database-shaped stays behind the seam and is tested directly in
+   `lib/__tests__/chat-persistence.test.ts` with fake clients.
 
-**New tests (`route.memory.test.ts`, mocking `@/utils/supabase/server`,
-`@/utils/supabase/admin`, the transcript/memory ports and the gateway):**
+**New tests (`route.memory.test.ts`, mocking `@/utils/supabase/server`, `@/lib/chat/search`,
+`@/lib/chat/prompt`, `@/lib/rate-limit-db`, `@/lib/ai/request-log`, `next/server`'s `after`,
+and — the new one — `@/lib/chat/persistence`, exactly as the existing integration test mocks
+its own collaborators):**
 
 1. No `conversationId` in the body → the store's `resolve` is called with `undefined`, a
    conversation is created, and `X-Conversation-Id` is returned.
@@ -930,14 +1007,21 @@ The riskiest task in the plan, so its constraints are explicit.
 8. The 400 ms timeout on `resolve` degrades to the client-history path with a log line.
 
 **Commit:** `feat(chat): own the transcript server-side`
-**Delta:** +1 file modified, +1 file added, ~14–18 tests.
+**Delta:** +3 files added, 2 modified (one of them additions-only), ~20–26 tests across the
+two new test files.
 
 ---
 
 ### Task 13 — Memory API and the recall branch
 
-**Files:** `app/api/ai-chat/memory/route.ts`, `lib/ai/memory/recall.ts`,
-`lib/__tests__/memory-recall.test.ts`, `app/api/ai-chat/memory/route.test.ts`
+**Files:** `app/api/ai-chat/memory/route.ts`, `app/api/ai-chat/memory/route.test.ts`,
+`lib/ai/memory/recall.ts`, `lib/__tests__/memory-recall.test.ts`, plus **additive** edits to
+`lib/chat/persistence.ts` (one `recallAnswer()` method), `app/api/ai-chat/route.ts` (the
+recall branch) and `app/api/ai-chat/route.memory.test.ts` (appended cases only — no existing
+assertion changes).
+
+*(Authorized by the plan: the recall question arrives through the chat route, so answering it
+needs a branch there and one method on the persistence seam. Rule 6 keeps that surgical.)*
 
 `recall.ts` is a pure matcher, and it is the one place where a wrong answer is worse than no
 answer — "what do you remember about episode 5?" is a tracker question, not a memory
@@ -971,6 +1055,16 @@ Route (`GET`/`DELETE`, both `createClient()`-authenticated, 401 when anonymous):
 - A malformed or missing `id` → 400 without a database call.
 - `AI_MEMORY=off` → `GET` still lists (transparency must survive the kill switch) and
   `DELETE` still works; only extraction and injection stop. State this in the plan's docs.
+
+**Rule 6 — the chat-route branch, kept minimal.** The route asks
+`isMemoryRecallQuestion(userMessage)` **before** retrieval. When it is true and persistence is
+available, it returns a plain-text response (same streaming headers the route already uses for
+refusals) carrying `renderMemoryAnswer(facts)`, where the facts come from a new
+`recallAnswer()` on the persistence seam — bounded by the same 400 ms timeout as the other
+pre-stream reads, and answered without a model call, because a memory listing is data, not
+generation. When the match is false, or persistence is unavailable, the route behaves exactly
+as it does today. Nothing else in the route changes, and the branch must not fire for a
+domain question: "what do you remember about episode 5" still goes to retrieval.
 
 **Commit:** `feat(chat): expose and answer the user's memories`
 **Delta:** +4 files, ~16–20 tests.

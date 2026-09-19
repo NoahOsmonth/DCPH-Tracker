@@ -78,7 +78,7 @@ const MESSAGE_TABLE = "ai_messages"
 const CONVERSATION_COLUMNS =
   "id,user_id,title,summary,summarized_through,message_count,last_message_at,archived_at"
 
-const MESSAGE_COLUMNS = "id,role,content,created_at"
+const MESSAGE_COLUMNS = "id,role,content,created_at,conversation_id"
 
 /**
  * The `!inner` embed is the whole ownership check for a message read: PostgREST
@@ -134,6 +134,10 @@ function rowToTurn(row: Record<string, unknown>): TranscriptTurn {
     role: row.role as TranscriptTurn["role"],
     content: String(row.content ?? ""),
     createdAt: toEpochMs(row.created_at),
+    // A message read spans conversations (`searchMessages`), so the row has to
+    // carry which one the turn belongs to. Absent stays undefined rather than
+    // becoming the string "undefined".
+    conversationId: row.conversation_id == null ? undefined : String(row.conversation_id),
   }
 }
 

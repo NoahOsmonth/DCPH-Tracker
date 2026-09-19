@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { CANON_TYPE_LABELS, MAX_EPISODE, canonTypeForEpisode } from "@/lib/canon-guide"
 import { STORY_ARCS, type StoryArc } from "@/lib/arcs-guide"
+import type { TranscriptPort, TranscriptTurn } from "@/lib/ai/conversations/port"
 import type { CorpusDocument } from "@/lib/ai/corpus/types"
 import type { WikiEvidence } from "@/lib/ai/retrieval/ladder"
 import { createStaticSource, type DocumentSource } from "@/lib/ai/retrieval/source"
@@ -141,6 +142,50 @@ function fakeWikiCache(evidence: WikiEvidence[]): { cache: WikiCache; lookups: s
         return evidence
       },
       async put() {},
+    },
+  }
+}
+
+/** One hit is enough: this file asserts dispatch, not search quality. */
+const CONVERSATION_TURNS: TranscriptTurn[] = [
+  {
+    id: "msg-1",
+    role: "assistant",
+    content: "We settled on episode 500.",
+    createdAt: Date.parse("2026-09-19T10:00:00.000Z"),
+    conversationId: "conv-1",
+  },
+]
+
+/**
+ * The transcript port as far as the registry is concerned: one canned search,
+ * empty answers everywhere else. The tool's own contract (the ownership id, the
+ * body cap, the rejection path) is pinned in ai-tools-conversations.test.ts.
+ */
+function fakeTranscriptPort(turns: TranscriptTurn[]): TranscriptPort {
+  return {
+    async conversationOwnedBy() {
+      return null
+    },
+    async recentConversation() {
+      return null
+    },
+    async createConversation() {
+      throw new Error("the registry never creates a conversation")
+    },
+    async updateConversation() {},
+    async lastMessages() {
+      return []
+    },
+    async messagesRange() {
+      return []
+    },
+    async appendMessages() {},
+    async listConversations() {
+      return []
+    },
+    async searchMessages() {
+      return turns
     },
   }
 }
@@ -292,6 +337,10 @@ function harness(
   const watch = options.watch === undefined ? fakeWatchClient().client : options.watch
   if (watch) ctx.watch = { client: watch, userId: USER_ID }
 
+  // Configured by default, so the sweep over TOOL_NAMES dispatches every name;
+  // the unconfigured case is the failure the other file pins.
+  ctx.conversations = { port: fakeTranscriptPort(CONVERSATION_TURNS), userId: USER_ID }
+
   return { ctx, fetches: recording.fetches, lookups: wiki.lookups }
 }
 
@@ -308,6 +357,7 @@ const ARGS: Record<ToolName, Record<string, unknown>> = {
   arc_for_range: { start: 1, end: 5 },
   next_unwatched: { limit: 3 },
   wiki_lookup: { topic: "Conan Edogawa" },
+  search_conversations: { query: "episode 500" },
 }
 
 describe("wikiLookup", () => {
@@ -498,8 +548,8 @@ describe("nextUnwatched", () => {
 })
 
 describe("TOOL_NAMES", () => {
-  it("registers exactly the seven tools", () => {
-    expect(TOOL_NAMES).toHaveLength(7)
+  it("registers exactly the eight tools", () => {
+    expect(TOOL_NAMES).toHaveLength(8)
     expect([...TOOL_NAMES]).toEqual([
       "search_catalog",
       "search_cases",
@@ -508,6 +558,7 @@ describe("TOOL_NAMES", () => {
       "arc_for_range",
       "next_unwatched",
       "wiki_lookup",
+      "search_conversations",
     ])
   })
 })

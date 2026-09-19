@@ -29,6 +29,13 @@ export interface TranscriptTurn {
   role: "user" | "assistant" | "system"
   content: string
   createdAt: number
+  /**
+   * The conversation the turn belongs to. Optional because not every reader is
+   * conversation-scoped — `searchMessages` spans the user's whole history, and
+   * that is the caller that needs the id to say which conversation a hit came
+   * from — while a turn a caller assembles by hand need not name one.
+   */
+  conversationId?: string
 }
 
 export interface NewConversation {

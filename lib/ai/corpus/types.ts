@@ -3,6 +3,11 @@ import type { RankableEntry } from "@/lib/chat/query"
 /**
  * Which source a document came from. Kept as a column so the retrieval ladder can
  * ask for "catalog only" or "characters only" without a second table.
+ *
+ * `conversations` is the one member with no `ai_documents` row behind it: those
+ * documents are built per request from the user's own transcript by the
+ * `search_conversations` tool, and the name exists so the assembly and citation
+ * layers treat them exactly like corpus evidence.
  */
 export type CorpusSource =
   | "content_entries"
@@ -14,6 +19,7 @@ export type CorpusSource =
   | "canon"
   | "movies"
   | "gadgets"
+  | "conversations"
 
 /**
  * Everything else a document wants to expose. Only the fields the scorer can use

@@ -16,6 +16,10 @@ import { lookupCharacter } from "@/lib/ai/tools/lookup-character"
 import { nextUnwatched, type WatchClient } from "@/lib/ai/tools/next-unwatched"
 import { searchCatalog } from "@/lib/ai/tools/search-catalog"
 import { searchCases } from "@/lib/ai/tools/search-cases"
+import {
+  searchConversations,
+  type ConversationSearchContext,
+} from "@/lib/ai/tools/search-conversations"
 import { wikiLookup } from "@/lib/ai/tools/wiki-lookup"
 
 export const TOOL_NAMES = [
@@ -26,6 +30,7 @@ export const TOOL_NAMES = [
   "arc_for_range",
   "next_unwatched",
   "wiki_lookup",
+  "search_conversations",
 ] as const
 
 export type ToolName = (typeof TOOL_NAMES)[number]
@@ -35,6 +40,8 @@ export interface ToolContext {
   wiki: WikiCache
   /** Required by next_unwatched only. */
   watch?: { client: WatchClient; userId: string }
+  /** Required by search_conversations only. */
+  conversations?: ConversationSearchContext
 }
 
 export interface ToolRequest {
@@ -233,6 +240,32 @@ async function runWikiLookup(
   return { ok: true, docs: [], data: await wikiLookup(topic.value, ctx.wiki, limit.value) }
 }
 
+async function runSearchConversations(
+  args: Record<string, unknown>,
+  ctx: ToolContext
+): Promise<ToolOutcome> {
+  const query = readString("search_conversations", args, "query")
+  if (!query.ok) return query
+  const limit = readOptionalNumber("search_conversations", args, "limit")
+  if (!limit.ok) return limit
+
+  const conversations = ctx.conversations
+  // An unconfigured tool is a failure, not an empty history: `ok: false` shows
+  // up in the execution report, while a silent `[]` would hide the wiring bug
+  // for the life of the feature.
+  if (!conversations) return { ok: false, error: "conversations_unavailable" }
+
+  const hits = await searchConversations(query.value, conversations, limit.value)
+
+  // The documents travel for the citation contract; the payload is the id list
+  // because every score is 0 by construction and repeating zeros says nothing.
+  return {
+    ok: true,
+    docs: hits.map((hit) => hit.doc),
+    data: hits.map((hit) => hit.doc.id),
+  }
+}
+
 /** Every name in TOOL_NAMES has a handler; the Record type is what enforces it. */
 const HANDLERS: Record<ToolName, ToolHandler> = {
   search_catalog: runSearchCatalog,
@@ -242,6 +275,7 @@ const HANDLERS: Record<ToolName, ToolHandler> = {
   arc_for_range: runArcForRange,
   next_unwatched: runNextUnwatched,
   wiki_lookup: runWikiLookup,
+  search_conversations: runSearchConversations,
 }
 
 function isToolName(value: unknown): value is ToolName {

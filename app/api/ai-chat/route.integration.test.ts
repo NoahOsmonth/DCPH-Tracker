@@ -31,6 +31,7 @@ const logRequest = vi.fn()
 vi.mock("@/lib/ai/request-log", () => ({
   logRequest: (...args: unknown[]) => logRequest(...args),
 }))
+vi.mock("@/lib/chat/persistence", () => ({ createRequestPersistence: async () => null }))
 
 // Inert stores: no circuit is open, every daily budget has room. See the note
 // above — these stand in for modules that cannot be imported without env.

@@ -1,4 +1,5 @@
 // app/api/ai-chat/route.ts
+import { after } from "next/server"
 import { createClient } from "@/utils/supabase/server"
 import { searchAll } from "@/lib/chat/search"
 import { buildSystemPrompt } from "@/lib/chat/prompt"
@@ -11,6 +12,12 @@ import { buildProviderTargets } from "@/lib/ai/targets"
 import { createGateway } from "@/lib/ai/gateway"
 import { logRequest } from "@/lib/ai/request-log"
 import { rateLimitPersistent } from "@/lib/rate-limit-db"
+import {
+  createRequestPersistence,
+  type PersistedTurn,
+  type RequestPersistence,
+} from "@/lib/chat/persistence"
+import { withTimeout } from "@/lib/request-timeout"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -25,6 +32,13 @@ const MAX_BODY_BYTES = 16_000
 
 /** Whole-request deadline, deliberately below `maxDuration`. */
 const TOTAL_BUDGET_MS = 45_000
+
+/**
+ * The ceiling on each transcript read the pre-stream path makes (rule 7). The
+ * store owns every database detail behind the persistence seam, so a slow
+ * database has one cost here: the client's own history is used instead.
+ */
+const PERSISTENCE_TIMEOUT_MS = 400
 
 const RATE_LIMIT = { limit: 20, windowMs: 5 * 60 * 1000 }
 
@@ -43,8 +57,10 @@ interface ChatTurn {
 /**
  * History is accepted from the client but treated as untrusted: it is only
  * ever replayed as conversational context, and roles are restricted so a
- * caller cannot inject a `system` turn. Server-owned transcripts arrive in a
- * later phase; until then this stays the authoritative sanitiser.
+ * caller cannot inject a `system` turn. It is also the fallback now that a
+ * server-owned transcript exists: whenever the transcript is unavailable — no
+ * service-role key, a degraded read, or a caller-supplied id the user does not
+ * own — this is what the model gets, exactly as before.
  */
 function sanitizeHistory(input: unknown): ChatTurn[] {
   if (!Array.isArray(input)) return []
@@ -99,6 +115,23 @@ function isSameOrigin(request: Request): boolean {
   }
 }
 
+/**
+ * Registers the post-response work with Next's `after`, and falls back to a
+ * plain fire-and-forget call when `after` throws because there is no request
+ * scope (unit tests, or any non-Next caller). Either way the work runs exactly
+ * once — it must not be dropped because the registration mechanism was
+ * unavailable — and a rejection cannot surface, because `after()` has no error
+ * boundary of its own.
+ */
+function scheduleAfter(work: Promise<void>): void {
+  const guarded = work.catch(() => {})
+  try {
+    after(() => guarded)
+  } catch {
+    void guarded
+  }
+}
+
 export async function POST(request: Request) {
   const targets = buildProviderTargets()
   if (targets.length === 0) {
@@ -121,7 +154,11 @@ export async function POST(request: Request) {
     return jsonError("Invalid JSON body.", 400)
   }
 
-  const { message, history } = (body ?? {}) as { message?: unknown; history?: unknown }
+  const { message, history, conversationId } = (body ?? {}) as {
+    message?: unknown
+    history?: unknown
+    conversationId?: unknown
+  }
   if (typeof message !== "string" || !message.trim()) {
     return jsonError("A non-empty `message` is required.", 400)
   }
@@ -130,7 +167,11 @@ export async function POST(request: Request) {
   }
 
   const userMessage = message.trim()
-  const priorTurns = sanitizeHistory(history)
+  const clientHistory = sanitizeHistory(history)
+  // An empty string is a client that sent the field with nothing in it; it
+  // means "no id", exactly as the store reads it.
+  const requestedConversationId =
+    typeof conversationId === "string" && conversationId ? conversationId : undefined
 
   const supabase = await createClient()
   const {
@@ -168,6 +209,48 @@ export async function POST(request: Request) {
     // Non-fatal profile lookup error
   }
 
+  // The transcript, when there is one. Every call is bounded and every failure
+  // degrades to the client's own history: a conversation problem must never
+  // cost an answer (constraint 14).
+  let persistence: RequestPersistence | null = null
+  try {
+    persistence = await withTimeout(
+      createRequestPersistence({ userId, conversationId: requestedConversationId }),
+      PERSISTENCE_TIMEOUT_MS
+    )
+  } catch (error) {
+    console.error("[ai-chat] transcript unavailable, using the client's history", error)
+  }
+  const activePersistence = persistence
+
+  let windowTurns: PersistedTurn[] | null = null
+  let conversationSummary: string | undefined
+  let memoryBlock = ""
+
+  if (activePersistence !== null) {
+    try {
+      const loaded = await withTimeout(activePersistence.window(), PERSISTENCE_TIMEOUT_MS)
+      // An empty window is a brand-new thread, not a transcript: the client's
+      // own history is still the better prompt until the server has one.
+      if (loaded !== null && loaded.turns.length > 0) {
+        windowTurns = loaded.turns
+        conversationSummary = loaded.summary ?? undefined
+      }
+    } catch (error) {
+      console.error("[ai-chat] transcript window unavailable, using the client's history", error)
+    }
+
+    try {
+      memoryBlock = await withTimeout(activePersistence.memories(userMessage), PERSISTENCE_TIMEOUT_MS)
+    } catch (error) {
+      // Memory is personalisation, never ground truth (constraint 15), so a
+      // failed read injects nothing rather than costing the answer.
+      console.error("[ai-chat] memory read unavailable", error)
+    }
+  }
+
+  const priorTurns = windowTurns ?? clientHistory
+
   const lastUserTurn = [...priorTurns].reverse().find((t) => t.role === "user")
   const searchQuery = lastUserTurn ? `${lastUserTurn.content} ${userMessage}` : userMessage
 
@@ -203,6 +286,8 @@ export async function POST(request: Request) {
     displayName,
     isSignedIn: Boolean(userId),
     siteUrl,
+    memories: memoryBlock,
+    conversationSummary,
   })
 
   const messages = [
@@ -211,9 +296,40 @@ export async function POST(request: Request) {
     { role: "user" as const, content: userMessage },
   ]
 
+  // Before the stream starts, so a client that disconnects immediately still
+  // has its question stored.
+  if (activePersistence !== null) {
+    try {
+      await withTimeout(activePersistence.record("user", userMessage), PERSISTENCE_TIMEOUT_MS)
+    } catch (error) {
+      console.error("[ai-chat] user turn not stored", error)
+    }
+  }
+
   const encoder = new TextEncoder()
   const gateway = createGateway()
   const requestStartedAt = Date.now()
+
+  // The answer the gateway actually emitted, accumulated as it arrives. This is
+  // what the transcript stores: the synthetic messages below are ours, not the
+  // model's, and a rate-limited or empty turn has no answer to store at all.
+  let answerText = ""
+  let settleTurn: (answer: string | null) => void = () => {}
+  // Resolved by the stream, consumed by the post-response work: `after` runs
+  // once the response is handed over, so the two cannot be joined any earlier.
+  const turnSettled = new Promise<string | null>((resolve) => {
+    settleTurn = resolve
+  })
+
+  let answerSettled = false
+  // Exactly once, from close() or from cancel(): the post-response work runs a
+  // single time, and a client that walks away mid-answer still has the text
+  // that arrived stored.
+  const settleAnswer = () => {
+    if (answerSettled) return
+    answerSettled = true
+    settleTurn(answerText.trim() === "" ? null : answerText)
+  }
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -228,6 +344,7 @@ export async function POST(request: Request) {
         } catch {
           // Already closed by a client disconnect.
         }
+        settleAnswer()
       }
 
       const enqueue = (text: string) => {
@@ -259,6 +376,7 @@ export async function POST(request: Request) {
           signal: budget.signal,
           onDelta: (text) => {
             if (firstTokenMs === null) firstTokenMs = Date.now() - requestStartedAt
+            answerText += text
             enqueue(text)
           },
         })
@@ -306,9 +424,27 @@ export async function POST(request: Request) {
     },
     cancel() {
       // The client disconnected. Upstream reads are released inside the
-      // gateway's finally block; nothing to do here.
+      // gateway's finally block; the turn still settles so the text that did
+      // arrive is stored rather than lost with the connection.
+      settleAnswer()
     },
   })
+
+  if (activePersistence !== null) {
+    const handle = activePersistence
+    scheduleAfter(
+      turnSettled.then(async (answer) => {
+        if (answer === null) return
+        try {
+          await handle.afterTurn({ answer })
+        } catch (error) {
+          // The seam contains its own failures; this is the last line of
+          // defence for work that runs after there is anyone to tell.
+          console.error("[ai-chat] post-response transcript write failed", error)
+        }
+      })
+    )
+  }
 
   return new Response(stream, {
     headers: {
@@ -316,6 +452,11 @@ export async function POST(request: Request) {
       "Cache-Control": "no-cache, no-store, no-transform",
       Connection: "keep-alive",
       "X-Accel-Buffering": "no",
+      // The client echoes this back on its next turn. Absent when there is no
+      // server-owned transcript, which is exactly today's response.
+      ...(activePersistence !== null
+        ? { "X-Conversation-Id": activePersistence.conversationId }
+        : {}),
     },
   })
 }

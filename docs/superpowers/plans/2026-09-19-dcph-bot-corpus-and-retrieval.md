@@ -324,10 +324,17 @@ Assert:
   `/alter table public\.ai_documents enable row level security/`,
   `/alter table public\.ai_wiki_cache enable row level security/`
 - both `revoke all on table ... from anon, authenticated` statements are present
-- the generated column uses the two-argument form in both places:
-  `expect(sql.match(/'english'::regconfig/g)).toHaveLength(2)`, and
-  `expect(sql).not.toMatch(/to_tsvector\(\s*coalesce/)` (that would be the one-argument,
+- the generated column uses the two-argument form in **both** of its branches. Scope the
+  slice to the column definition — the same regconfig also appears in `ai_docs_fts`, so a
+  whole-file count would be 3, not 2:
+  ```ts
+  const generated = sql.slice(sql.indexOf("fts tsvector"), sql.indexOf(") stored"))
+  expect(generated.match(/'english'::regconfig/g)).toHaveLength(2)
+  ```
+  and `expect(sql).not.toMatch(/to_tsvector\(\s*coalesce/)` (that would be the one-argument,
   non-immutable form, which Postgres rejects inside a generated column)
+- `websearch_to_tsquery` passes the regconfig explicitly, so R2 does not depend on the
+  session's `default_text_search_config`: `expect(sql.match(/'english'::regconfig/g)).toHaveLength(3)`
 - `using gin (fts)`, `extensions.gin_trgm_ops`, `using gin (aliases)`
 - all three function names appear, each followed (within its body) by `stable`:
   `expect(sql.match(/\bstable\b/g)).toHaveLength(3)`
@@ -575,6 +582,17 @@ itself is deleted in Plan 4, so the corpus text is what the bot will answer from
 - no character doc sets `episodeNumber` (the deliberate non-pollution rule from `types.ts`)
 - at least one character doc's body contains `First appearance:` — proving debut metadata
   is folded in
+- **the relationship skip branch**: call `buildRelationshipDocs(relationships, [])` with a
+  two-character/two-relationship fixture — an empty character list means both endpoints are
+  missing, so it returns `[]`; and with a list containing the first relationship's endpoints
+  but not the second's, only `relationship:<first>` is emitted. (The real curated data has no
+  dangling edges — verified: every `source`/`target` resolves to a character id — so this
+  branch can only be covered from a fixture.)
+- **implementation notes that must not be "fixed" back**: `CorpusDocumentSeed` is a
+  `type` alias of `CorpusDocument` (an interface cannot re-export); arc metadata omits
+  `episode_end` when `StoryArc.episodeEnd` is null, because `DocMetadata.episode_end` is
+  `number | undefined` and undefined already means "ongoing" — the body carries `Ep 784+`;
+  `formatEpisodeRange` takes a `StoryArc`, so call it directly.
 - the movie doc for number 19 has `movieNumber === 19` and its title equals the
   `MAINLINE_MOVIES` entry's `english` (look it up, do not hardcode a title string)
 - every doc has a non-empty `title`, and every id matches `/^[a-z_]+:[^\s]+$/`
@@ -691,12 +709,20 @@ with two linked cases, one case with no entry, one movie entry). Assert:
 - the case doc id is `case:<page_title>#<case_index>` and two cases on the same page
   produce two distinct ids
 - `arc_title` metadata is resolved when `arcTitleById` provides it and is null otherwise
-- `buildCorpusDocuments({ entries, cases })` equals the concatenation of the two builders'
-  outputs, has unique ids, and is stable across two calls
+- `buildCorpusDocuments({ entries, cases })` starts with the concatenation of the two
+  builders' outputs (the curated groups always follow), has unique ids, and is stable across
+  two calls. Note that `buildCorpusDocuments` sorts each group by id while the two tracker
+  builders preserve row order, so the identity holds on the result's head with an
+  already-id-ordered fixture.
 - `buildCorpusDocuments()` with no input returns only the curated docs (length
   `> 250`), which proves the default path cannot silently produce an empty corpus
 - `buildCorpusDocuments({ entries: [dupA, dupB] })` where both rows share a slug keeps
   exactly one `entry:<slug>` doc
+- **`crime_types` is part of the structural row type** (`crime_types?: string[]`) even
+  though the plan's verbatim interface omits it, because the metadata rule requires reading
+  it. And `metadata.arc_slug` may be a literal `null`: `DocMetadata.arc_slug` is
+  `string | undefined`, so writing null goes through the metadata index signature via a
+  small documented helper. Both are shipped behaviour — do not "fix" either back.
 
 **Commit:** `feat(ai): build the tracker half of the retrieval corpus`
 
@@ -739,7 +765,16 @@ Implementation notes that matter:
   `insert into ... select ... from (values (...))` block. Both put the same nine values
   in the same leading positions (`slug, title, type, episode_number, movie_number,
   air_date, ... , synopsis` at index 8), and the second block indents its rows. So: take
-  any line whose `trimStart()` starts with `(`, split the tuple, and accept arity `>= 9`.
+  any line whose `trimStart()` starts with `('` — **the quote matters**, because the second
+  statement's column list and computation lines (`  (slug, title, ...`, `  (last.m + n) as
+  canon_order, ...`, `  (last.m + n) as release_order`) also begin with `(` and are not
+  rows; matching on a bare `(` makes `skipped` 3 instead of 0. Accept arity `>= 9`.
+  A tuple that terminates with 9+ values but whose slug and title are not quoted strings is
+  also counted as skipped — "did not yield a usable row" is what keeps the counter honest.
+  Verified counts for the real file: 1,331 rows (1,317 + 14) and `skipped === 0`.
+- `canonOrder` on the second statement's 14 rows is the block's local `n`, not the stored
+  `canon_order` (SQL computes `last.m + n`). Inherent to a static parse. Do not write an
+  eval expectation against `canonOrder` for those rows.
 - Split the tuple with a character scanner, not a regex: values are single-quoted with
   `''` as the escape (`'President''s Daughter Kidnapping Case'`), and unquoted values are
   `NULL` or bare numbers. Track whether each value was quoted so `'NULL'` (the string)
@@ -1083,11 +1118,21 @@ Behaviour, in order:
    re-fuse all three lists. Skipped for budget → step `skipped: "budget"`, and `degraded`
    becomes `"retrieval_budget"`.
 6. If still `< threshold` **and** `needsLore` is true and the budget is not spent, and a
-   `wiki` dependency was provided → R4. Otherwise the R4 step records why it was skipped
-   (`"enough_evidence"`, `"no_lore_needed"`, `"budget"`, or `"no_wiki_source"`).
+   `wiki` dependency was provided → R4. Otherwise the R4 step records why it was skipped —
+   one of `"no_lore_needed"`, `"budget"`, or `"no_wiki_source"`.
 7. Hydrate the fused ids via `source.fetch`, then `rankCandidates` with the request's
    `keywords` / `numbers` / chronological flags, capped at `limit` (default 12).
 8. Return `docs`, `wiki`, `steps`, `degraded`.
+
+**`steps` is the contiguous prefix of rounds the ladder engaged with**, not always four
+entries: R1 and R2 are always present; R3 appears only when the threshold was unmet after
+them (either having run, or with `skipped: "budget"`); R4 appears only when the threshold
+was still unmet after R3. So "evidence was already sufficient" is not a step — there is no
+`"enough_evidence"` reason, because in that case the round is simply absent. A round that
+was skipped reports `hits: 0` and `ms: 0`. `hits` is the branch's raw hit count (the number
+of extracts for R4). "Budget spent" means `elapsed >= budgetMs`. Rejection isolation
+(`hits: 0`, `skipped: "error"`, ladder still resolves) applies to R3, R4 and hydration as
+well as R1/R2, and never sets `degraded` — only a budget skip does that.
 
 The threshold counts **distinct candidate ids**, not documents: that is what R1+R2
 produced, and re-counting after hydration would let a hydration miss silently re-run the
@@ -1273,9 +1318,28 @@ export async function searchCases(
 
 Both: derive `keywords = tokenize(query, 8)`, `numbers = extractNumbers(query)`,
 `preferRecent` / `preferEarliest` from the query helpers; run `entity` (only when
-`numbers.length > 0`) and `fullText` against the source with the candidate limit; fuse with
-RRF; hydrate; `rankCandidates`; then keep only documents whose `source` matches
-(`content_entries` for catalog, `dcw_cases` for cases) and truncate to `limit`.
+`numbers.length > 0`), `fullText`, **and `fuzzy`** against the source with the candidate
+limit; fuse all three lists with RRF; hydrate; `rankCandidates`; then keep only documents
+whose `source` matches (`content_entries` for catalog, `dcw_cases` for cases) and truncate
+to `limit`.
+
+**Fuzzy belongs here even though the ladder only reaches R3 when the threshold is unmet.**
+A tool call is a *narrow lookup*, not the whole ladder: without the fuzzy list, the typo
+test ("roller coaser" must find "Roller Coaster Murder Case") cannot pass at all, because
+strict token-AND matches nothing and the query has no number for the entity branch. The
+cost is one extra RPC per tool invocation; the alternative is a tool that cannot tolerate a
+misspelling the ladder tolerates.
+
+**Do not let `rankCandidates` truncate before the filter.** Pass it the candidate pool size
+as its `limit` and apply the caller's `limit` only after the source filter — otherwise the
+mixed corpus's top 12 can be entirely characters and arcs, and a catalog query would return
+`[]` while the matching episode sits at rank 13. The filter-then-truncate order is the
+behaviour the tests pin.
+
+The typo test asserts the retrievable fact — the hit's `origins` contains `"fuzzy"` — rather
+than the zero-score survival rule: `roller` is a substring of that title, so `scoreEntry`
+scores it above 0 and it lands in the scored group. The zero-score rule keeps its coverage in
+`lib/__tests__/retrieval-candidates.test.ts` (Task 7).
 
 The source filter is applied **after** ranking, because the Phase 2 RPCs have no source
 parameter (Task 1's signature) and the corpus is one index. Record the limitation in a
@@ -1513,6 +1577,21 @@ and never rejects: a tool that throws becomes `{ ok: false, error: message }`, a
 unknown name or a missing/mistyped argument becomes `ok: false` with a message naming the
 tool and the argument. A deterministic tool whose answer needs no documents still succeeds
 with `docs: []`. `next_unwatched` without `ctx.watch` fails with a clear message.
+
+**Shipped refinements to record (do not "fix" them back):**
+
+- `WatchClient.eq` returns a thenable that also chains (`WatchQuery extends Promise<WatchResult>`),
+  because the real chain is `.eq("type","episode").order("canon_order", { ascending: true }).limit(n)`
+  and PostgREST's builder is thenable. Since the interface has no `.range()`, the "3 pages of
+  500" rule is implemented as a **widening window** — `limit(500)` → `limit(1000)` → `limit(1500)`,
+  stopping on a short page or once enough unwatched rows exist.
+- `lookup_character` with no match returns `ok: true, data: null, docs: []` — the tool ran and
+  found nobody. `ok: false` is reserved for the failures named above. **Plan 4's assembler must
+  treat `data: null` as a miss.**
+- `lookup_character` returns the character's own doc plus at most six neighbour docs (max 7).
+- `search_catalog` / `search_cases` swallow retrieval failures by their own contract, so they
+  never produce `ok: false`; the rejecting-source test therefore exercises `lookup_character`
+  and `arc_for_range`.
 
 **Test:** `lib/__tests__/ai-tools-registry.test.ts`. Assert:
 
@@ -1838,7 +1917,59 @@ and the fixture must keep at least 50 cases.
 - note that `supabase/migrations/20260919100000_ai_corpus.sql` is committed but **not**
   applied to the remote project
 
-**Commit:** `test(ai): gate retrieval on a golden recall@5 eval`
+**Commit:** `test(ai): gate retrieval on a golden recall@5 eval` (plus
+`lib/ai/retrieval/ladder.ts` and `lib/ai/corpus/curated.ts`, see below)
+
+**Execution notes (recorded after the task, per §8 criterion 9).**
+
+The first full pass scored 49/59 = 0.831, below the gate. Classifying every miss
+showed two classes worth a principled change, and both stayed inside Phase 2's
+scope:
+
+- `ENTITY_CANDIDATES` 20 → 100. R1's weakest tier — title substring, rank 1.0 —
+  matches a short keyword anywhere in a title ("ran" inside "strange"), so the
+  whole tier ties and is ordered by id, and it can run past a hundred rows. At 20
+  slots a document whose title contains two of the query's names never reached
+  the scorer that would have ranked it first. Fixed seven cases; 80 slots gave
+  54/59, 100 gave 56/59.
+- Arc episode-range aliases in `buildArcDocs`. An arc owns no `episode_number`,
+  so only the alias branch can match "179"/"345" in "which arc covers episodes
+  179 to 345". Without them the question was decided by an id tie-break among
+  seven arcs that all matched the word "arc".
+
+Result: **58/60 = 0.967**, verified a second time by an independent probe that
+rebuilt the corpus, re-ran all 60 cases and confirmed the fixture contains zero
+unknown ids.
+
+Two cases still miss, both ranking weaknesses with their cause identified, and
+both left failing rather than papered over:
+
+- "Who is Heiji Hattori?" returns five episode entries titled after him and
+  ranks `character:heiji-hattori` seventh. Episode titles collect the phrase
+  bonus while the character document does not, because `tokenize` sorts keywords
+  by length. **The fix belongs in `lib/chat/query.ts`, which this plan freezes** —
+  so it is queued for Plan 4, not worked around here.
+- "Tell me about the Kaitou Kid thread" ranks `thread:kaitou-kid` behind a
+  character document and four relationship documents.
+
+Plan bugs and gaps found while executing this task:
+
+1. **The commit list contradicts the task's own authority to adjust retrieval.**
+   This section names four paths, but the adjustments it authorizes live in
+   `ladder.ts` and `curated.ts`. Committing four paths would leave HEAD failing
+   the gate test the same commit adds, so the commit carries six. A reviewer who
+   wants the literal four-path commit should split the retrieval changes into
+   their own commit rather than revert them.
+2. **"Removing a case requires a recorded reason in its `note` field" is
+   impossible** — a removed case has no `note` to carry it. The record belongs in
+   the test file's header. No case was removed here, so this stayed moot.
+3. **The `needsLore` guidance contradicts itself**: "add a `needsLore` case or two
+   which the empty wiki dep will simply not answer" versus "do not build a
+   lore-dependent expectation". The second wins — all 11 `needsLore` cases have
+   corpus-reachable expectations, so none is designed to fail.
+4. **The corpus-assembly step omits an adapter**: `parseSeedEntries` returns
+   camelCase `SeedEntry` while `buildCorpusDocuments` wants snake_case
+   `ContentEntryRow`. The test carries the twelve-field projection explicitly.
 
 ---
 
@@ -1885,8 +2016,12 @@ when all of the following hold and are reported verbatim:
 - `lib/ai/corpus/ingest.ts` — Plan 6 (observability) adds the cron wiring for the route.
 - Deferred deliberately: the response cache (Plan 3, where conversation identity exists),
   a `p_source` argument on the three RPCs (only if mixed-corpus dilution shows up in
-  measurements), and the live wiki fetcher wiring (`searchDcwWiki` injected into
-  `createWikiCache` where the route lives, Plan 4).
+  measurements), the live wiki fetcher wiring (`searchDcwWiki` injected into
+  `createWikiCache` where the route lives, Plan 4), and **`collectTrackerRows` reading the
+  `arcs` table to feed `buildEntryDocs`'s `arcTitleById`** — without it, ingested entry
+  documents carry `metadata.arc_slug: null`, so "which episodes are in the Vermouth arc"
+  is answered only by the arc document, not by the episode documents. Add it when an arc
+  question is seen to miss in `ai_request_log`.
 
 
 

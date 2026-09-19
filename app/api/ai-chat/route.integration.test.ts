@@ -88,6 +88,7 @@ async function readText(response: Response): Promise<string> {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  process.env.AI_PIPELINE = "v1"
   process.env.GROQ_API_KEY = KEY
   delete process.env.GEMINI_API_KEY
   delete process.env.OPENROUTER_API_KEY

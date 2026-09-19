@@ -162,6 +162,7 @@ let persistence: FakePersistence
 
 beforeEach(() => {
   vi.clearAllMocks()
+  process.env.AI_PIPELINE = "v1"
   delete process.env.AI_MEMORY
   process.env.GROQ_API_KEY = KEY
   delete process.env.GEMINI_API_KEY

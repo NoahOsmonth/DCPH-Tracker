@@ -1,7 +1,7 @@
 // app/api/ai-chat/route.ts
 import { after } from "next/server"
 import { createClient } from "@/utils/supabase/server"
-import { searchAll } from "@/lib/chat/search"
+import { getUserWatchHistory, searchAll } from "@/lib/chat/search"
 import { buildSystemPrompt } from "@/lib/chat/prompt"
 import {
   REFUSAL_NO_CONTEXT,
@@ -9,8 +9,12 @@ import {
   shouldRefuseForMissingContext,
 } from "@/lib/chat/intent"
 import { buildProviderTargets } from "@/lib/ai/targets"
-import { createGateway } from "@/lib/ai/gateway"
+import { createGateway, type ChatMessage } from "@/lib/ai/gateway"
+import { validateCitations } from "@/lib/ai/citations"
 import { isMemoryRecallQuestion } from "@/lib/ai/memory/recall"
+import { pipelineVersion, runPipeline, type PipelineResult } from "@/lib/ai/pipeline"
+import type { AdminRowsClient, ResolverClient } from "@/lib/ai/pipeline/source-resolver"
+import { toStructuredCall } from "@/lib/ai/structured-call"
 import { logRequest } from "@/lib/ai/request-log"
 import { rateLimitPersistent } from "@/lib/rate-limit-db"
 import {
@@ -138,6 +142,31 @@ function scheduleAfter(work: Promise<void>): void {
   }
 }
 
+/** The pipeline's narration, prefixed like every other line this route writes. */
+function pipelineLog(line: string): void {
+  console.error(`[ai-chat] ${line}`)
+}
+
+/**
+ * The one degraded reason `ai_request_log` records, in precedence order.
+ *
+ * A failed retrieval says more than anything the request did afterwards, then
+ * the pipeline's own reason (the corpus fallback, a stage budget, eviction), the
+ * screening's exclusions (D4), and finally an evidence-backed answer that cited
+ * nothing valid (D3). v1 keeps today's `retrieval_failed`-or-null behaviour.
+ */
+function degradedReasonFor(input: {
+  retrievalFailed: boolean
+  pipeline: PipelineResult | null
+  uncited: boolean
+}): string | null {
+  if (input.retrievalFailed) return "retrieval_failed"
+  if (input.pipeline === null) return null
+  if (input.pipeline.degraded !== null) return input.pipeline.degraded
+  if (input.pipeline.screening.excluded.length > 0) return "screened"
+  return input.uncited ? "uncited" : null
+}
+
 export async function POST(request: Request) {
   const targets = buildProviderTargets()
   if (targets.length === 0) {
@@ -201,6 +230,11 @@ export async function POST(request: Request) {
   if (intent.action === "refuse") {
     return refusalResponse(intent.reply)
   }
+
+  // Read once, before any retrieval work: the rollback is a decision about
+  // this request, and `runPipeline` reads the same variable to make the same
+  // one. `v1` is the only value that selects the old path (constraint 11).
+  const version = pipelineVersion(process.env)
 
   const userId = user.id
   let displayName: string | null = null
@@ -273,51 +307,159 @@ export async function POST(request: Request) {
   }
 
   const priorTurns = windowTurns ?? clientHistory
+  const priorUserMessages = priorTurns.filter((t) => t.role === "user").map((t) => t.content)
 
   const lastUserTurn = [...priorTurns].reverse().find((t) => t.role === "user")
   const searchQuery = lastUserTurn ? `${lastUserTurn.content} ${userMessage}` : userMessage
 
-  const retrieveStartedAt = Date.now()
-  let context: Awaited<ReturnType<typeof searchAll>>
-  let retrievalFailed = false
-  try {
-    context = await searchAll(searchQuery, userId)
-  } catch {
-    retrievalFailed = true
-    context = { episodes: [], cases: [], dcwWiki: [] }
-  }
-  const retrieveMs = Date.now() - retrieveStartedAt
+  const siteUrl = process.env.NEXT_PUBLIC_SITE_URL ?? "https://dcphtracker.vercel.app"
 
-  const hasInDomainContext =
-    context.episodes.length > 0 ||
-    context.cases.length > 0 ||
-    context.dcwWiki.some((r) => r.source === "dcw")
+  // One budget for the whole request, not one per stage: the planner and the
+  // answer stream share a single clock, so a request that plans for a second
+  // cannot also stream for the full budget, and a client that disconnects
+  // while the planner is thinking aborts it (constraint 10).
+  const budget = new AbortController()
+  const budgetTimer = setTimeout(() => budget.abort(), TOTAL_BUDGET_MS)
+  const abortOnDisconnect = () => budget.abort()
+  if (request.signal.aborted) {
+    budget.abort()
+  } else {
+    request.signal.addEventListener("abort", abortOnDisconnect)
+  }
+  const releaseBudget = () => {
+    clearTimeout(budgetTimer)
+    request.signal.removeEventListener("abort", abortOnDisconnect)
+  }
+
+  const gateway = createGateway()
+
+  const retrieveStartedAt = Date.now()
+  let context: Awaited<ReturnType<typeof searchAll>> = { episodes: [], cases: [], dcwWiki: [] }
+  let hasInDomainContext = false
+  let retrievalFailed = false
+  let pipelineResult: PipelineResult | null = null
+  let pipelineThrew = false
+  let systemPrompt = ""
+
+  if (version === "v2") {
+    // v2's retrieval context is empty: the evidence blocks carry the facts and
+    // every context section is content-gated. The one exception is the watch
+    // history, which v1 got for free inside `searchAll` and the pipeline does
+    // not fetch — it stays a real read, bounded like every other pre-stream one.
+    let watchHistory: Awaited<ReturnType<typeof getUserWatchHistory>>
+    try {
+      watchHistory = await withTimeout(getUserWatchHistory(userId), PERSISTENCE_TIMEOUT_MS)
+    } catch (error) {
+      console.error("[ai-chat] watch history unavailable", error)
+    }
+
+    // The memory block and the rolling summary are NOT passed here: the
+    // assembler owns both sections, and passing them twice would put two
+    // copies of each in the prompt. They reach the model through `runPipeline`.
+    systemPrompt = buildSystemPrompt({
+      context: { episodes: [], cases: [], dcwWiki: [], watchHistory },
+      displayName,
+      isSignedIn: Boolean(userId),
+      siteUrl,
+    })
+
+    // `ai_documents` and `ai_wiki_cache` are service-role only (the corpus
+    // migration revokes them from anon and authenticated and enables RLS with
+    // no policies), so the indexed corpus is reachable only through the admin
+    // client — a user-scoped one would probe "reachable" and then read nothing.
+    // Dynamic on purpose: the v1 route, and the tests that pin it, must not
+    // load the env-dependent admin module at all.
+    const { createAdminClient } = await import("@/utils/supabase/admin")
+    // The resolver declares its clients structurally, so the generated Supabase
+    // type is narrowed once here rather than leaking PostgREST inward — the
+    // same seam `createRequestPersistence` uses.
+    const admin = createAdminClient() as unknown as (ResolverClient & AdminRowsClient) | null
+
+    const plannerCall = toStructuredCall(gateway, {
+      targets,
+      signal: budget.signal,
+    })
+
+    try {
+      pipelineResult = await runPipeline({
+        message: searchQuery,
+        priorTurns,
+        priorUserMessages,
+        systemPrompt,
+        memories: memoryBlock,
+        summary: conversationSummary ?? null,
+        userId,
+        client: admin,
+        admin,
+        plannerCall,
+        plannerStrict: targets.some((target) => target.supportsJsonSchema),
+        now: Date.now,
+        log: pipelineLog,
+      })
+    } catch (error) {
+      // `runPipeline` contains its own stages; this is the belt to that
+      // braces. The request continues without evidence and the refusal gate
+      // decides whether an unevidenced answer is honest — never a 500.
+      pipelineThrew = true
+      retrievalFailed = true
+      console.error("[ai-chat] pipeline unavailable, answering without evidence", error)
+    }
+  }
+
+  if (pipelineResult === null && !pipelineThrew) {
+    // v1: today's retrieval, refusal gate input and prompt, byte-for-byte in
+    // behaviour (constraint 11). Also the defensive branch when the pipeline
+    // itself reports the rollback.
+    try {
+      context = await searchAll(searchQuery, userId)
+    } catch {
+      retrievalFailed = true
+    }
+
+    hasInDomainContext =
+      context.episodes.length > 0 ||
+      context.cases.length > 0 ||
+      context.dcwWiki.some((r) => r.source === "dcw")
+
+    systemPrompt = buildSystemPrompt({
+      context,
+      displayName,
+      isSignedIn: Boolean(userId),
+      siteUrl,
+      memories: memoryBlock,
+      conversationSummary,
+    })
+  }
+
+  // The pipeline measures its own retrieval; v1's is the wall clock around
+  // `searchAll`, which is also the honest number when the pipeline threw.
+  const retrieveMs =
+    pipelineResult !== null ? pipelineResult.timings.retrieveMs : Date.now() - retrieveStartedAt
+
+  // D8: the gate keeps its signature, and only its `hasContext` source changes
+  // between the paths — the assembly's evidence on v2, v1's own in-domain hit.
+  const hasContext = pipelineResult !== null ? pipelineResult.evidence.length > 0 : hasInDomainContext
   if (
     shouldRefuseForMissingContext({
       searchQuery,
-      priorUserMessages: priorTurns.filter((t) => t.role === "user").map((t) => t.content),
-      hasContext: hasInDomainContext,
+      priorUserMessages,
+      hasContext,
     })
   ) {
+    releaseBudget()
     return refusalResponse(REFUSAL_NO_CONTEXT)
   }
 
-  const siteUrl = process.env.NEXT_PUBLIC_SITE_URL ?? "https://dcphtracker.vercel.app"
-
-  const systemPrompt = buildSystemPrompt({
-    context,
-    displayName,
-    isSignedIn: Boolean(userId),
-    siteUrl,
-    memories: memoryBlock,
-    conversationSummary,
-  })
-
-  const messages = [
-    { role: "system" as const, content: systemPrompt },
-    ...priorTurns,
-    { role: "user" as const, content: userMessage },
-  ]
+  // The assembler leaves the current user turn to the route (it is the only
+  // place that has the user's own words), so it is appended here on both paths.
+  const messages: ChatMessage[] =
+    pipelineResult !== null
+      ? [...pipelineResult.messages, { role: "user", content: userMessage }]
+      : [
+          { role: "system", content: systemPrompt },
+          ...priorTurns,
+          { role: "user", content: userMessage },
+        ]
 
   // Before the stream starts, so a client that disconnects immediately still
   // has its question stored.
@@ -330,7 +472,6 @@ export async function POST(request: Request) {
   }
 
   const encoder = new TextEncoder()
-  const gateway = createGateway()
   const requestStartedAt = Date.now()
 
   // The answer the gateway actually emitted, accumulated as it arrives. This is
@@ -378,19 +519,9 @@ export async function POST(request: Request) {
         }
       }
 
-      // One budget for the whole request, not one per provider. The gateway's
-      // timeouts are per target, so a run of stalled providers can outlast the
-      // platform's own limit — and a response the platform cuts never gets the
-      // "cut short" label. Aborting ourselves keeps that label ours to write.
-      const budget = new AbortController()
-      const budgetTimer = setTimeout(() => budget.abort(), TOTAL_BUDGET_MS)
-      const abortOnDisconnect = () => budget.abort()
-      if (request.signal.aborted) {
-        budget.abort()
-      } else {
-        request.signal.addEventListener("abort", abortOnDisconnect)
-      }
-
+      // The budget was hoisted before retrieval: the planner and the stream
+      // share one clock, and the disconnect listener that aborts both was
+      // registered there too. This is where that clock stops.
       let result
       try {
         result = await gateway.streamChat({
@@ -404,8 +535,7 @@ export async function POST(request: Request) {
           },
         })
       } finally {
-        clearTimeout(budgetTimer)
-        request.signal.removeEventListener("abort", abortOnDisconnect)
+        releaseBudget()
       }
 
       if (result.aborted) {
@@ -424,6 +554,15 @@ export async function POST(request: Request) {
         close()
       }
 
+      // The citation contract is checked on the answer the model actually
+      // emitted. `answerText` never contains the synthetic messages below, so
+      // a rate-limited or empty turn cannot be read as an uncited answer (D3).
+      const citations = validateCitations({
+        text: answerText,
+        evidence: pipelineResult?.evidence ?? [],
+        requireCitation: (pipelineResult?.evidence.length ?? 0) > 0,
+      })
+
       // Fire-and-forget: observability must not delay or fail the response.
       void logRequest({
         userId,
@@ -441,8 +580,25 @@ export async function POST(request: Request) {
         ttftMs: firstTokenMs,
         totalMs: Date.now() - requestStartedAt,
         attempts: result.attempts,
-        docCount: context.episodes.length + context.cases.length + context.dcwWiki.length,
-        degradedReason: retrievalFailed ? "retrieval_failed" : null,
+        // v2's documents are the numbered evidence refs; v1 has no refs, so
+        // its count stays the rows retrieval returned.
+        docCount:
+          pipelineResult !== null
+            ? pipelineResult.evidence.length
+            : context.episodes.length + context.cases.length + context.dcwWiki.length,
+        degradedReason: degradedReasonFor({
+          retrievalFailed,
+          pipeline: pipelineResult,
+          uncited: citations.uncited,
+        }),
+        ...(pipelineResult !== null
+          ? {
+              planSource: pipelineResult.planSource,
+              tools: pipelineResult.toolNames,
+              planMs: pipelineResult.timings.planMs,
+              citationsValid: citations.valid,
+            }
+          : {}),
       })
     },
     cancel() {

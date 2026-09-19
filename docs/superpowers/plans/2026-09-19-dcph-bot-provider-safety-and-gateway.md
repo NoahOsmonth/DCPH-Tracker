@@ -967,14 +967,23 @@ count: confirm every table has both `enable row level security` and a `revoke al
 that no statement is `drop` or a destructive `alter`.
 
 ```bash
+grep -c "create table" supabase/migrations/20260919090000_ai_gateway_infra.sql
 grep -c "enable row level security" supabase/migrations/20260919090000_ai_gateway_infra.sql
 grep -c "revoke all" supabase/migrations/20260919090000_ai_gateway_infra.sql
-grep -niE "^drop|^alter" supabase/migrations/20260919090000_ai_gateway_infra.sql
+grep -niE "^alter" supabase/migrations/20260919090000_ai_gateway_infra.sql | grep -v "enable row level security"
+grep -niE "\bdrop\b|\btruncate\b|^\s*delete\s+from\b" supabase/migrations/20260919090000_ai_gateway_infra.sql
 npx tsc --noEmit
 ```
 
-Expected: the two counts are BOTH equal to the number of `create table` statements in the
-file; the third command prints nothing; `tsc` is clean.
+Expected: the three counts are all EQUAL — one `enable row level security` and one
+`revoke all` per `create table`, so only `service_role` can reach the new tables. The two
+`grep` filters print nothing: the only `alter` permitted is enabling RLS, and nothing in
+the file drops, truncates or deletes. `tsc` is clean (SQL is not typechecked; this only
+confirms the migration did not disturb anything incidental).
+
+The `delete` filter is anchored to `delete from` on purpose: a bare `\bdelete\b` also
+matches the referential action in `references auth.users (id) on delete set null`, which is
+the opposite of destructive.
 
 - [ ] **Step 2b: Apply to a local instance (when available)**
 

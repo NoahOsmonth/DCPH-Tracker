@@ -200,6 +200,80 @@ one. They share the same code path (`runLegacyRetrieval`), so there is one thing
 signature and its tests; in v2 its `hasContext` argument is "the assembly holds at least one
 document or wiki extract". The intent refusals (`classifyChatIntent`) are untouched.
 
+### D9–D19 — corrections found while executing this plan
+
+Each item below is a place where the plan above, or the code the plan described, turned out to be
+wrong; the original text is left standing as the record of what was planned. Every one of these was
+found by a measurement, and every one ships as built, not as planned.
+
+**D9 — The merge does not re-rank; the assembler evicts from the tail (Task 6 and Task 8, amended
+at Task 15).** Task 6 specified `mergeEvidence`'s total order as `rrf desc, score desc, id asc`. The
+pipeline-level eval measured **50/60** with it: `rankCandidates`
+(`lib/ai/retrieval/candidates.ts`) deliberately fuses first and scores second, and re-sorting by
+`rrf` threw the scorer's verdict away — for `"What is the relationship between Conan and Ran?"` the
+merge promoted `arc:conan-arc` (score 3) and two characters above both expected
+`relationship:` documents (score 8), so the model never saw them. `mergeEvidence` now keeps the
+ladder's order verbatim and appends the tools' hits after it, and `compareEviction` evicts from the
+tail of that order rather than by ascending `rrf` (equivalent when the input is already rrf-sorted,
+correct otherwise). Measured: **50/60 → 60/60**. Commits `b04b061`, `bf4dc18`.
+
+**D10 — Task 1's asymmetry assertion was falsified by Task 5.** `lib/__tests__/pipeline-plan.test.ts`
+asserted that `TOOL_NAMES` does *not* contain `search_conversations` — true before Task 5, false
+after. Replaced with mutual coverage (every registry entry has a plan variant) at `e1aa361`.
+
+**D11 — Task 5's file list was incomplete.** Shipping the tool also required
+`lib/ai/conversations/port.ts` (`TranscriptTurn.conversationId`),
+`lib/ai/conversations/supabase-port.ts` (`conversation_id` in the message columns) and
+`lib/ai/corpus/types.ts` (the `"conversations"` source). Its documents are titled "Earlier
+conversation" unconditionally: the transcript port carries no title.
+
+**D12 — Task 6's report shape grew.** `dropped[]` (the ladder subsumes `search_catalog`,
+`search_cases` and `wiki_lookup`, so those steps are recorded rather than dispatched), a
+`ladder_failed` degrade, and `score: 0` / `rrf: 0` on tool-only documents, because no gather ranked
+them.
+
+**D13 — Task 8's `system` budget is 1,500, not 900.** The rebuilt prompt measures 1,324 tokens
+(5,713 chars) with the provenance legend and the citation contract in it; the ceiling is a report
+baseline anyway, since the system prompt is never evicted. The section-conditionality change
+(context sections render only when they carry content) keeps a rich payload at 7,429/7,979 chars
+against `chat-prompt.test.ts`'s 6,500-char ceiling, which now holds only for a focused retrieval.
+
+**D14 — Task 11's `PipelineInput` gained three fields.** `userId`, `plannerCall` and
+`plannerStrict`: the route builds the structured call with `toStructuredCall` and passes it, because
+without it `AI_PLANNER` would be inert in v2. The legacy fallback's converted documents carry
+`entry:` / `case:` ids.
+
+**D15 — Tasks 12 and 13 swapped order.** The route cannot pass `planSource` / `tools` /
+`citationsValid` to `logRequest` before `RequestLogEntry` accepts them, so the columns (Task 13)
+shipped before the wiring (Task 12).
+
+**D16 — Conversation turns are not tagged in-band.** `[USR]` is a tier *name* the prompt's legend
+uses; the assembler emits turns as separate `role: "user"` / `role: "assistant"` messages, because
+prefixing someone's own words with a tag would rewrite their message for the provider's chat
+template.
+
+**D17 — Task 14's remedy was insufficient as written.** Its rule 1 (an order-insensitive half bonus,
++2) leaves `character:heiji-hattori` at 10 against six episode rows at 12 — measured, it cannot fix
+the miss it exists for. The fix that works is the plan's own diagnosis read literally: `tokenize`
+decides *which* keywords survive by specificity but returns the survivors **in the query's word
+order**, so `scoreEntry`'s phrase bonus asks whether the user's words, in the order they asked,
+appear together in the title. Retrieval eval **0.9667 → 0.9833** (58/60 → 59/60). Rule 1's
+all-terms bonus shipped as well (+2, whole-word, never summed with the phrase bonus) and measured no
+change at the gate. The remaining miss, `"Tell me about the Kaitou Kid thread"` (expects
+`thread:kaitou-kid`, gets `character:kaitou-kid` first), is router-level thread-vs-character
+disambiguation, not scoring. `lib/__tests__/retrieval-ladder.test.ts`'s keyword-order pin was
+updated in the same change (`d369f72`).
+
+**D18 — Task 16's three soft spots, as documented.** `degraded_reason: "screened"` is set only when
+no stronger reason exists; the three log columns are written only when `runPipeline` returned a
+result, so a v2 request whose pipeline threw also writes null; and the legacy fallback triggers on
+the **screened** evidence being empty (the pre-assembly set), not the assembled one — a lone
+document evicted for size does not re-trigger it.
+
+**D19 — Counting note for every number in this document.** The working tree holds one untracked test
+file from another workstream (`lib/__tests__/characters-graph-engine.test.ts`, 7 tests), so a
+working-tree count runs exactly 7 above the committed tree's. Both are quoted at completion.
+
 ---
 
 ## 6. Task index
@@ -577,6 +651,9 @@ Rules:
    missed with `rrf: 0` (they are precise hits, not ranked candidates). The output is ordered by
    `rrf` descending, then `score` descending, then id — a total order, so the assembly's numbering
    is stable across runs. Determinism is the point: `[E3]` must mean the same document on a retry.
+   *Falsified by measurement; see D9.* The plan's order is now: the ladder's ranked order, verbatim,
+   with the tools' hits appended — re-sorting by `rrf` discards `rankCandidates`' verdict and cost
+   the pipeline eval 10 of 60 cases. Determinism survives (the ladder's order is total too).
 5. **The whole stage is bounded** by `EXECUTE_BUDGET_MS`: the tools and the ladder race it, and
    expiry returns what has arrived with `degraded: "execute_budget"`. Already-resolved results are
    never discarded to honour the budget.
@@ -1006,6 +1083,9 @@ Rule:
 
 **Commit:** `fix(chat): match word-order variants in the title bonus`
 **Delta:** 1 modified file, additive test cases, ~6–10 tests, plus the eval numbers.
+*At completion:* rule 1 alone was measured insufficient for the miss it exists for; the ordering fix
+is what moved the eval (0.9667 → 0.9833). See D17. Actual: 1 source file, 7 net tests, one
+assertion in `retrieval-ladder.test.ts` repinned (`d369f72`).
 
 ---
 
@@ -1036,6 +1116,12 @@ Rules:
 
 **Commit:** `test(ai): gate the pipeline on the golden set`
 **Delta:** +1 test file, ~8–12 tests. Gate: also `npm run build`.
+*At completion:* 9 tests, and it earned its keep — the first run came in red at **50/60** and the
+failure was a real defect in Task 6's merge order, fixed under D9 (`b04b061`, eval `bf4dc18`). Final
+number: **1.0000 (60/60)**, pre-eviction and post-eviction identical, so the evidence budget costs no
+recall. It also proved the router/planner bridge: all 11 `needsLore` fixture cases carry
+`needsLore: true` on their plan, and the router's own keywords score better through the ladder
+(60/60) than the bare ladder does (59/60).
 
 ---
 
@@ -1088,11 +1174,23 @@ Rules:
    (`lib/__tests__/chat-prompt.test.ts`, `lib/__tests__/chat-query.test.ts`,
    `lib/__tests__/ai-tools-registry.test.ts`, `lib/ai/__tests__/request-log.test.ts` — all
    additive except `chat-prompt.test.ts`, whose gadget/watch-order cases are replaced and listed).
+   *Corrected at completion:* two files were named by tasks that shipped after this list was
+   written and are added here — `app/api/ai-chat/route.integration.test.ts` and
+   `app/api/ai-chat/route.memory.test.ts`, one line each (`process.env.AI_PIPELINE = "v1"` in
+   `beforeEach`, so both remain the standing v1 regression proofs, criterion 6), numstat `1 0`
+   each. Two more moved beyond the word "additive": `lib/__tests__/chat-query.test.ts` replaced one
+   order-asserting test with two (D17), and `lib/__tests__/retrieval-ladder.test.ts` had its
+   keyword-order pin updated to the query order (D17, `d369f72`). The other rewritten files are
+   ones this plan created (`pipeline-execute.test.ts`, `pipeline-assemble.test.ts`, both D9).
+   Final counts: **1,194 tests / 75 files** in the working tree and **1,176 / 73** committed — the
+   difference is the untracked file of D19.
 2. `npx tsc --noEmit` exits 0.
 3. `npm run lint` reports 0 errors (the 14 pre-existing warnings may remain).
 4. `npm run build` succeeds, and `/api/ai-chat` still appears with the same three routes.
 5. The golden eval is ≥ `RECALL_GATE` at the pipeline level (Task 15) **and** the retrieval-level
    number is reported before and after Task 14. Today's: 0.9667.
+   *Corrected at completion:* retrieval **0.9667 → 0.9833** (D17) and pipeline-level **1.0000
+   (60/60)** after D9 — the 0.9667 quoted here was the pre-Task-14 number and is stale.
 6. `AI_PIPELINE=v1` is proven: `app/api/ai-chat/route.integration.test.ts` passes with its one
    added line, and the report quotes that line's numstat.
 7. The two deleted prompt blocks are gone, with the test that proves it named.

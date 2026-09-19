@@ -531,7 +531,7 @@ schema-capable target injected it stays on the router's plan and spends nothing.
 **`AI_PIPELINE`.** Unset, empty or any value other than exactly `v1` runs v2 (surrounding
 whitespace is tolerated, case is not). `v1` restores the previous path behind the same route —
 `searchAll` plus the Plan 3 prompt, byte-for-byte in behaviour — and it therefore gets none of
-v2's properties: no plan is made and `plan_source` is not written, nothing is screened so
+v2's properties: no plan is made and `plan_source` stays null, nothing is screened so
 `degraded_reason` can never be `"screened"`, citations are not validated and `citations_valid`
 stays null, and the memory block and rolling summary go back into `buildSystemPrompt` instead of
 being owned by the assembler. It remains the rollback (constraint 11), and
@@ -555,7 +555,7 @@ The deployed project is exactly that case today: none of the `20260919*` migrati
 so `ai_documents` does not exist and the probe fails. Because `createSupabaseSource` swallows a
 missing table and returns `[]`, a pipeline that read it without asking would answer *"I could not
 find a reliable answer"* to every question. The corpus fallback is therefore explicit
-(constraint 12, D7): when the resolved mode is `static` and the assembled evidence is empty,
+(constraint 12, D7): when the resolved mode is `static` and the screened evidence is empty,
 `runPipeline` calls `runLegacyRetrieval` — the same `searchAll` the route uses for
 `AI_PIPELINE=v1` — converts its `ChatContext` into documents and wiki extracts with the same
 builders the ingestion route uses, screens that too, and re-assembles. The result carries
@@ -653,7 +653,7 @@ it: Phase 4 records, Phase 5 renders chips.
 | `citations_valid` | `boolean` | whether every cited `[E#]` resolved to supplied evidence |
 
 The mapping uses `?? null`, never a falsy test, so an empty tool list (`[]`) and a `false`
-citation verdict survive as real answers; null means the row predates the pipeline. `tools` is
+citation verdict survive as real answers, while null means no v2 decision was recorded. `tools` is
 capped at `MAX_LOGGED_TOOLS` (8) before insert — the plan caps itself at four steps, so the bound
 never truncates a real request. A `v1` request leaves all three null, and so does a v2 request
 whose pipeline threw. `degraded_reason` on v2 carries, in precedence order, `retrieval_failed`,

@@ -1138,11 +1138,12 @@ Read-and-archive only; Phase 5's drawer is the consumer.
 
 1. `npm test` passes, with the pre-existing suite unmodified except where a task names a file
    (`lib/__tests__/chat-prompt.test.ts` gains cases; `app/api/ai-chat/route.integration.test.ts`
-   is untouched). Report the final test and file counts against the 655 / 46 baseline.
+   gains the one `vi.mock` Task 12 rule 6 authorizes and nothing else). Report the final test
+   and file counts against the 655 / 46 baseline.
 2. `npx tsc --noEmit` exits 0.
 3. `npm run lint` reports 0 errors (the 14 pre-existing warnings may remain).
-4. `npm run build` succeeds, and `/api/ai-chat` plus the three new routes appear in the route
-   listing.
+4. `npm run build` succeeds, and `/api/ai-chat` plus the two new route paths
+   (`/api/ai-chat/memory`, `/api/ai-chat/conversations`) appear in the route listing.
 5. `lib/chat/query.ts` is byte-identical:
    `git log --oneline <plan-3-start>..HEAD -- lib/chat/query.ts` is empty.
 6. `components/chat/ChatWidget.tsx` and the other nine in-flight files are untouched:
@@ -1154,6 +1155,15 @@ Read-and-archive only; Phase 5's drawer is the consumer.
    three of four turns, one on the fourth) and quotes Task 10's test that asserts the zero.
 9. Every deviation from this plan that a subagent had to make, and every plan bug found during
    execution, is listed. Contradictions found twice are recorded in this document.
+
+*(Two of these criteria were stale by the time the phase ended, and both were corrected at
+completion rather than worked around. Criterion 1's "`route.integration.test.ts` is untouched"
+was superseded by Task 12 rule 6's amendment, which authorizes exactly one added `vi.mock` in
+that file so the route cannot reach a live store from a unit test; the actual diff against the
+plan's start is `1 insertion, 0 deletions`, and that number is the backward-compatibility
+proof. Criterion 4's "three new routes" was an arithmetic slip — Phase 3 adds two route paths,
+`/api/ai-chat/memory` and `/api/ai-chat/conversations`, alongside the modified `/api/ai-chat`.
+The build's route listing shows all three.)*
 
 ---
 

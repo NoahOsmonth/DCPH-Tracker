@@ -333,6 +333,32 @@ rate-limited" from the trace *and* Task 7's D5 state badge. Task 7 owns the D5 b
 1,325 tests (node 79/1,250, dom 4/75); `tsc` exit 0; lint 0 errors / 14 warnings; build succeeds with
 the four `/api/ai-chat*` bundles and `/community/chat` unchanged at 110 kB.
 
+**C25 — Task 7 item 1's "CitationChips when refs exist" is imprecise.** `CitationChips` returns
+`null` without a `CitationReport`, so refs alone render no chips. `ChatMessage` keys both the chips
+and its parts guard off `citations !== null`. A refs-without-report turn is still fully described by
+the trace and the panel.
+
+**C26 — Task 7 item 1 never defines the `stopped` case for feedback.** `MessageState` is a precedence
+(C14), not a partition, so "complete" does not name every non-streaming ending. The rule:
+feedback is offered for `complete`, `degraded` and `synthetic` endings; a `stopped` turn is a partial
+the reader chose to end and offers none. Both cases are pinned by tests.
+
+**C27 — Task 7's delta of "~12 tests" undercounts**; the task's own required coverage exceeds it and
+the file has 20.
+
+**C28 — The gate's "unless the widget now imports something new" can never trigger.**
+`ChatWidget` is never in a route's first-load JS: `components/chat/ChatWidgetLoader.tsx` imports it
+dynamically with `ssr: false` from `app/layout.tsx`, so `ChatMessage`'s four new static imports land
+in the lazy widget chunk. `/community/chat`'s first load stays 110 kB and cannot observe them; a
+change there would be a different regression.
+
+**Verified at Task 7's close** (`5146632`) — **Tasks 1–7 complete**: 84 files / 1,345 tests (node
+79/1,250, dom 5/95); `tsc` exit 0 (the C23 proof — `ChatWidget.tsx` was not edited, and its worktree
+still matches the index); lint 0 errors / 14 warnings; build succeeds with the four `/api/ai-chat*`
+bundles. The only removals in `ChatMessage.tsx` are the old non-exported props interface and the old
+function body, whose classNames moved into shared constants unchanged — so the legacy caller renders
+byte-identically, asserted by a test that pins the exact className strings.
+
 ## 6. Task index
 
 | # | Task | Files | Commit |

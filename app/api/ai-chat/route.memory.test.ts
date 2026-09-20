@@ -13,6 +13,13 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import {
+  isTextUIPart,
+  parseJsonEventStream,
+  readUIMessageStream,
+  uiMessageChunkSchema,
+  type UIMessage,
+} from "ai"
 
 const getUser = vi.fn()
 const maybeSingle = vi.fn()
@@ -143,6 +150,38 @@ async function readText(response: Response): Promise<string> {
   return await response.text()
 }
 
+/**
+ * The streamed response as the SDK itself reads it. The answer no longer
+ * crosses the wire as plain text, so an assertion about it reconstructs the
+ * text from the message parts rather than reading the SSE body.
+ */
+async function readStream(response: Response): Promise<UIMessage> {
+  const body = response.body
+  if (body === null) throw new Error("the response carried no body")
+
+  const chunks = parseJsonEventStream({ stream: body, schema: uiMessageChunkSchema }).pipeThrough(
+    new TransformStream({
+      transform(chunk, controller) {
+        if (!chunk.success) throw chunk.error
+        controller.enqueue(chunk.value)
+      },
+    })
+  )
+
+  let message: UIMessage | undefined
+  for await (const snapshot of readUIMessageStream({ stream: chunks })) message = snapshot
+  if (message === undefined) throw new Error("the response produced no message")
+  return message
+}
+
+/** The answer as the reader sees it: every text part, concatenated. */
+function answerText(message: UIMessage): string {
+  return message.parts
+    .filter(isTextUIPart)
+    .map((part) => part.text)
+    .join("")
+}
+
 /** Runs whatever the route registered with `after`, once the body was read. */
 async function runAfterTasks(): Promise<void> {
   for (const call of after.mock.calls) {
@@ -195,7 +234,7 @@ describe("POST /api/ai-chat with server-owned transcripts", () => {
       conversationId: undefined,
     })
     expect(response.headers.get("X-Conversation-Id")).toBe(CONVERSATION_ID)
-    expect(await readText(response)).toBe("Hi there")
+    expect(answerText(await readStream(response))).toBe("Hi there")
   })
 
   it("passes a body conversationId through to the seam", async () => {
@@ -224,7 +263,7 @@ describe("POST /api/ai-chat with server-owned transcripts", () => {
     )
 
     expect(response.status).toBe(200)
-    expect(await readText(response)).toBe("Hi there")
+    expect(answerText(await readStream(response))).toBe("Hi there")
     expect(sentMessages(fetchMock).some((m) => m.content === "earlier question")).toBe(true)
     expect(spy.mock.calls[0]?.[0]).toContain("[ai-chat]")
     spy.mockRestore()
@@ -276,7 +315,7 @@ describe("POST /api/ai-chat with server-owned transcripts", () => {
     const { POST } = await import("@/app/api/ai-chat/route")
 
     const response = await POST(post({ message: USER_MESSAGE }))
-    expect(await readText(response)).toBe("Hi there")
+    expect(answerText(await readStream(response))).toBe("Hi there")
     await runAfterTasks()
 
     expect(events).toEqual(["record:user", "fetch"])
@@ -288,11 +327,11 @@ describe("POST /api/ai-chat with server-owned transcripts", () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response("busy", { status: 429 })))
     const { POST } = await import("@/app/api/ai-chat/route")
 
-    const text = await readText(await POST(post({ message: USER_MESSAGE })))
+    const message = await readStream(await POST(post({ message: USER_MESSAGE })))
     await runAfterTasks()
 
     // The synthetic capacity message is not an answer, so it is never stored.
-    expect(text).toMatch(/at capacity/i)
+    expect(answerText(message)).toMatch(/at capacity/i)
     expect(persistence.afterTurn).not.toHaveBeenCalled()
   })
 
@@ -316,10 +355,10 @@ describe("POST /api/ai-chat with server-owned transcripts", () => {
     )
     const { POST } = await import("@/app/api/ai-chat/route")
 
-    const text = await readText(await POST(post({ message: USER_MESSAGE })))
+    const message = await readStream(await POST(post({ message: USER_MESSAGE })))
     await runAfterTasks()
 
-    expect(text).toContain("cut short")
+    expect(answerText(message)).toContain("cut short")
     expect(persistence.afterTurn).toHaveBeenCalledWith({ answer: "The victim was" })
   })
 
@@ -338,7 +377,7 @@ describe("POST /api/ai-chat with server-owned transcripts", () => {
     const response = await pending
 
     expect(response.status).toBe(200)
-    expect(await readText(response)).toBe("Hi there")
+    expect(answerText(await readStream(response))).toBe("Hi there")
     expect(sentMessages(fetchMock).some((m) => m.content === "earlier question")).toBe(true)
     expect(spy.mock.calls[0]?.[0]).toContain("[ai-chat]")
     spy.mockRestore()
@@ -358,7 +397,7 @@ describe("POST /api/ai-chat with server-owned transcripts", () => {
     await vi.advanceTimersByTimeAsync(400)
     const response = await pending
 
-    expect(await readText(response)).toBe("Hi there")
+    expect(answerText(await readStream(response))).toBe("Hi there")
     expect(sentMessages(fetchMock).some((m) => m.content === "earlier question")).toBe(true)
     expect(spy.mock.calls[0]?.[0]).toContain("[ai-chat]")
     spy.mockRestore()
@@ -375,7 +414,7 @@ describe("POST /api/ai-chat with server-owned transcripts", () => {
     await vi.advanceTimersByTimeAsync(400)
     const response = await pending
 
-    expect(await readText(response)).toBe("Hi there")
+    expect(answerText(await readStream(response))).toBe("Hi there")
     const promptArgs = buildSystemPromptArgs.mock.calls[0]?.[0] as { memories?: string }
     expect(promptArgs.memories).toBe("")
     spy.mockRestore()
@@ -390,7 +429,7 @@ describe("POST /api/ai-chat with server-owned transcripts", () => {
 
     expect(response.status).toBe(200)
     expect(response.headers.get("X-Conversation-Id")).toBeNull()
-    expect(await readText(response)).toBe("Hi there")
+    expect(answerText(await readStream(response))).toBe("Hi there")
   })
 
   it("uses the server's window instead of the client's history when it has one", async () => {
@@ -444,9 +483,11 @@ describe("POST /api/ai-chat with a memory question", () => {
     vi.stubGlobal("fetch", fetchMock)
     const { POST } = await import("@/app/api/ai-chat/route")
 
-    const text = await readText(await POST(post({ message: "what do you remember about episode 5" })))
+    const message = await readStream(
+      await POST(post({ message: "what do you remember about episode 5" }))
+    )
 
-    expect(text).toBe("Episode 5 is")
+    expect(answerText(message)).toBe("Episode 5 is")
     expect(persistence.recallAnswer).not.toHaveBeenCalled()
     expect(fetchMock).toHaveBeenCalled()
   })
@@ -470,7 +511,7 @@ describe("POST /api/ai-chat with a memory question", () => {
     await vi.advanceTimersByTimeAsync(400)
     const response = await pending
 
-    expect(await readText(response)).toBe("Hi there")
+    expect(answerText(await readStream(response))).toBe("Hi there")
     expect(fetchMock).toHaveBeenCalled()
     expect(spy.mock.calls[0]?.[0]).toContain("[ai-chat]")
     spy.mockRestore()
@@ -484,7 +525,7 @@ describe("POST /api/ai-chat with a memory question", () => {
     vi.stubGlobal("fetch", fetchMock)
     const { POST } = await import("@/app/api/ai-chat/route")
 
-    const text = await readText(
+    const message = await readStream(
       await POST(
         post({
           message: "what do you remember about me",
@@ -493,7 +534,7 @@ describe("POST /api/ai-chat with a memory question", () => {
       )
     )
 
-    expect(text).toBe("Hi there")
+    expect(answerText(message)).toBe("Hi there")
     expect(fetchMock).toHaveBeenCalled()
   })
 })

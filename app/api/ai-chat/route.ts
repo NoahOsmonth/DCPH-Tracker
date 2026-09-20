@@ -1,5 +1,6 @@
 // app/api/ai-chat/route.ts
 import { after } from "next/server"
+import { createUIMessageStream, createUIMessageStreamResponse } from "ai"
 import { createClient } from "@/utils/supabase/server"
 import { getUserWatchHistory, searchAll } from "@/lib/chat/search"
 import { buildSystemPrompt } from "@/lib/chat/prompt"
@@ -9,10 +10,23 @@ import {
   shouldRefuseForMissingContext,
 } from "@/lib/chat/intent"
 import { buildProviderTargets } from "@/lib/ai/targets"
-import { createGateway, type ChatMessage } from "@/lib/ai/gateway"
+import { createGateway, type ChatMessage, type StreamChatResult } from "@/lib/ai/gateway"
 import { validateCitations } from "@/lib/ai/citations"
 import { isMemoryRecallQuestion } from "@/lib/ai/memory/recall"
 import { pipelineVersion, runPipeline, type PipelineResult } from "@/lib/ai/pipeline"
+import {
+  EMPTY_RESULT_REASON,
+  PARTS,
+  PARTIAL_ANSWER_REASON,
+  RATE_LIMITED_REASON,
+  RETRIEVAL_FAILED_REASON,
+  SCREENED_REASON,
+  UNCITED_REASON,
+  buildActivityPart,
+  buildCitationsPart,
+  buildDegradedPart,
+  buildEvidencePart,
+} from "@/lib/ai/stream/protocol"
 import type { AdminRowsClient, ResolverClient } from "@/lib/ai/pipeline/source-resolver"
 import { toStructuredCall } from "@/lib/ai/structured-call"
 import { logRequest } from "@/lib/ai/request-log"
@@ -52,6 +66,9 @@ const EMPTY_RESULT_MESSAGE =
 const RATE_LIMITED_MESSAGE =
   "All free AI providers are temporarily at capacity. Please try again in a moment."
 const PARTIAL_RESULT_SUFFIX = "\n\n_(The response was cut short. Ask again to retry.)_"
+
+/** The one text part's id: stable, so every delta lands in the same part. */
+const ANSWER_PART_ID = "answer"
 
 type ChatRole = "user" | "assistant"
 interface ChatTurn {
@@ -165,6 +182,42 @@ function degradedReasonFor(input: {
   if (input.pipeline.degraded !== null) return input.pipeline.degraded
   if (input.pipeline.screening.excluded.length > 0) return "screened"
   return input.uncited ? "uncited" : null
+}
+
+/**
+ * The degrade reasons the reader is told about before the model is called, in
+ * `degradedReasonFor`'s order: retrieval's failure, the pipeline's own reason,
+ * the screening's exclusions.
+ *
+ * This is the union where `degradedReasonFor` is the precedence ladder: the log
+ * records the one reason that says most, while the UI shows every reason that
+ * applies, so a request that both lost its corpus and dropped a document is not
+ * silently reported as one of the two.
+ */
+function preAnswerDegradedReasons(input: {
+  retrievalFailed: boolean
+  pipeline: PipelineResult | null
+}): string[] {
+  const reasons: string[] = []
+  if (input.retrievalFailed) reasons.push(RETRIEVAL_FAILED_REASON)
+  if (input.pipeline !== null) {
+    if (input.pipeline.degraded !== null) reasons.push(input.pipeline.degraded)
+    if (input.pipeline.screening.excluded.length > 0) reasons.push(SCREENED_REASON)
+  }
+  return reasons
+}
+
+/**
+ * The degrade reasons that only exist once the answer does: `uncited` is a
+ * verdict on the finished text, and the synthetic token names why the stream
+ * ended. Both are written as a `degraded` part after the text, so the client
+ * must apply a late part to the message it just rendered (Task 4).
+ */
+function lateDegradedReasons(input: { uncited: boolean; synthetic: string | null }): string[] {
+  const reasons: string[] = []
+  if (input.uncited) reasons.push(UNCITED_REASON)
+  if (input.synthetic !== null) reasons.push(input.synthetic)
+  return reasons
 }
 
 export async function POST(request: Request) {
@@ -471,7 +524,6 @@ export async function POST(request: Request) {
     }
   }
 
-  const encoder = new TextEncoder()
   const requestStartedAt = Date.now()
 
   // The answer the gateway actually emitted, accumulated as it arrives. This is
@@ -486,126 +538,165 @@ export async function POST(request: Request) {
   })
 
   let answerSettled = false
-  // Exactly once, from close() or from cancel(): the post-response work runs a
-  // single time, and a client that walks away mid-answer still has the text
-  // that arrived stored.
+  // Exactly once, from the stream's end or from the client disconnecting: the
+  // post-response work runs a single time, and a client that walks away
+  // mid-answer still has the text that arrived stored.
   const settleAnswer = () => {
     if (answerSettled) return
     answerSettled = true
     settleTurn(answerText.trim() === "" ? null : answerText)
   }
 
-  const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      let closed = false
+  // The SDK's stream has no cancel hook, so a disconnect is read off the
+  // request signal — the same one the budget's abort listener watches. The
+  // gateway's own `aborted` result settles the turn too; `settleAnswer`'s guard
+  // makes the two one settle rather than two.
+  const settleOnDisconnect = () => settleAnswer()
+  request.signal.addEventListener("abort", settleOnDisconnect)
+
+  const stream = createUIMessageStream({
+    execute: async ({ writer }) => {
       let firstTokenMs: number | null = null
+      let textStarted = false
 
-      const close = () => {
-        if (closed) return
-        closed = true
-        try {
-          controller.close()
-        } catch {
-          // Already closed by a client disconnect.
+      // One text part for the whole answer: `text-start` opens it on the first
+      // write, and each delta is the gateway's own string. The SDK frames the
+      // stream; it never re-encodes or trims the answer.
+      const writeText = (delta: string) => {
+        if (!textStarted) {
+          textStarted = true
+          writer.write({ type: "text-start", id: ANSWER_PART_ID })
         }
-        settleAnswer()
+        writer.write({ type: "text-delta", id: ANSWER_PART_ID, delta })
       }
 
-      const enqueue = (text: string) => {
-        try {
-          controller.enqueue(encoder.encode(text))
-        } catch {
-          closed = true
-        }
+      const writeDegraded = (reasons: string[]) => {
+        const part = buildDegradedPart(reasons)
+        if (part !== null) writer.write({ type: PARTS.degraded, data: part })
       }
 
-      // The budget was hoisted before retrieval: the planner and the stream
-      // share one clock, and the disconnect listener that aborts both was
-      // registered there too. This is where that clock stops.
-      let result
       try {
-        result = await gateway.streamChat({
-          messages,
-          targets,
-          signal: budget.signal,
-          onDelta: (text) => {
-            if (firstTokenMs === null) firstTokenMs = Date.now() - requestStartedAt
-            answerText += text
-            enqueue(text)
-          },
+        // What the pipeline did, then what it found: both are known before the
+        // model is called, so the trace and the sources render while the answer
+        // streams. v1 sends no evidence part at all — a part the server does
+        // not send is a part the UI does not show.
+        writer.write({
+          type: PARTS.activity,
+          data: buildActivityPart({ pipeline: pipelineResult, retrieveMs }),
+        })
+        if (pipelineResult !== null) {
+          writer.write({ type: PARTS.evidence, data: buildEvidencePart(pipelineResult) })
+        }
+        writeDegraded(preAnswerDegradedReasons({ retrievalFailed, pipeline: pipelineResult }))
+
+        // The budget was hoisted before retrieval: the planner and the stream
+        // share one clock, and the disconnect listener that aborts both was
+        // registered there too. This is where that clock stops.
+        let result: StreamChatResult
+        try {
+          result = await gateway.streamChat({
+            messages,
+            targets,
+            signal: budget.signal,
+            onDelta: (text) => {
+              if (firstTokenMs === null) firstTokenMs = Date.now() - requestStartedAt
+              answerText += text
+              writeText(text)
+            },
+          })
+        } finally {
+          releaseBudget()
+        }
+
+        // The synthetic strings are ours, not the model's: they reach the
+        // reader but never `answerText`, so the transcript and the citation
+        // validator see the model's own words only. `syntheticReason` names the
+        // state, and its `degraded` part is written below — after the text it
+        // describes, because it is only known once the stream has ended.
+        let syntheticReason: string | null = null
+        if (result.aborted) {
+          // Our own budget expiring is not the same as the user closing the
+          // tab: in the first case they are still listening and the answer must
+          // be labelled, in the second there is nobody left to tell.
+          if (result.textChars > 0 && !request.signal.aborted) {
+            syntheticReason = PARTIAL_ANSWER_REASON
+            writeText(PARTIAL_RESULT_SUFFIX)
+          }
+        } else if (!result.ok) {
+          syntheticReason = result.rateLimited ? RATE_LIMITED_REASON : EMPTY_RESULT_REASON
+          writeText(result.rateLimited ? RATE_LIMITED_MESSAGE : EMPTY_RESULT_MESSAGE)
+        } else if (result.midStreamFailure || result.truncated) {
+          syntheticReason = PARTIAL_ANSWER_REASON
+          writeText(PARTIAL_RESULT_SUFFIX)
+        }
+
+        if (textStarted) writer.write({ type: "text-end", id: ANSWER_PART_ID })
+
+        // The citation contract is checked on the answer the model actually
+        // emitted. `answerText` never contains the synthetic messages above, so
+        // the suffix is never parsed as a citation (D3). A turn that produced no
+        // answer at all still reports `uncited` when evidence was supplied; the
+        // late part below pairs it with the synthetic reason that explains it.
+        const citations = validateCitations({
+          text: answerText,
+          evidence: pipelineResult?.evidence ?? [],
+          requireCitation: (pipelineResult?.evidence.length ?? 0) > 0,
+        })
+
+        // The late part: `uncited` and the synthetic token are only known now,
+        // so a client must apply a `degraded` part that arrives after the text
+        // rather than assume the part always precedes it (Task 4).
+        writeDegraded(
+          lateDegradedReasons({ uncited: citations.uncited, synthetic: syntheticReason })
+        )
+
+        // v1 sends no citation part: it has no evidence to resolve against.
+        if (pipelineResult !== null) {
+          writer.write({ type: PARTS.citations, data: buildCitationsPart(citations) })
+        }
+
+        // Fire-and-forget: observability must not delay or fail the response.
+        void logRequest({
+          userId,
+          targetId: result.targetId,
+          outcome: result.aborted
+            ? "aborted"
+            : result.ok
+              ? result.truncated
+                ? "partial"
+                : "ok"
+              : result.rateLimited
+                ? "rate_limited"
+                : "empty",
+          retrieveMs,
+          ttftMs: firstTokenMs,
+          totalMs: Date.now() - requestStartedAt,
+          attempts: result.attempts,
+          // v2's documents are the numbered evidence refs; v1 has no refs, so
+          // its count stays the rows retrieval returned.
+          docCount:
+            pipelineResult !== null
+              ? pipelineResult.evidence.length
+              : context.episodes.length + context.cases.length + context.dcwWiki.length,
+          degradedReason: degradedReasonFor({
+            retrievalFailed,
+            pipeline: pipelineResult,
+            uncited: citations.uncited,
+          }),
+          ...(pipelineResult !== null
+            ? {
+                planSource: pipelineResult.planSource,
+                tools: pipelineResult.toolNames,
+                planMs: pipelineResult.timings.planMs,
+                citationsValid: citations.valid,
+              }
+            : {}),
         })
       } finally {
-        releaseBudget()
+        // However the stream ended, the turn ended with it.
+        settleAnswer()
+        request.signal.removeEventListener("abort", settleOnDisconnect)
       }
-
-      if (result.aborted) {
-        // Our own budget expiring is not the same as the user closing the tab:
-        // in the first case they are still listening and the answer must be
-        // labelled, in the second there is nobody left to tell.
-        if (result.textChars > 0 && !request.signal.aborted) {
-          enqueue(PARTIAL_RESULT_SUFFIX)
-        }
-        close()
-      } else if (!result.ok) {
-        enqueue(result.rateLimited ? RATE_LIMITED_MESSAGE : EMPTY_RESULT_MESSAGE)
-        close()
-      } else {
-        if (result.midStreamFailure || result.truncated) enqueue(PARTIAL_RESULT_SUFFIX)
-        close()
-      }
-
-      // The citation contract is checked on the answer the model actually
-      // emitted. `answerText` never contains the synthetic messages below, so
-      // a rate-limited or empty turn cannot be read as an uncited answer (D3).
-      const citations = validateCitations({
-        text: answerText,
-        evidence: pipelineResult?.evidence ?? [],
-        requireCitation: (pipelineResult?.evidence.length ?? 0) > 0,
-      })
-
-      // Fire-and-forget: observability must not delay or fail the response.
-      void logRequest({
-        userId,
-        targetId: result.targetId,
-        outcome: result.aborted
-          ? "aborted"
-          : result.ok
-            ? result.truncated
-              ? "partial"
-              : "ok"
-            : result.rateLimited
-              ? "rate_limited"
-              : "empty",
-        retrieveMs,
-        ttftMs: firstTokenMs,
-        totalMs: Date.now() - requestStartedAt,
-        attempts: result.attempts,
-        // v2's documents are the numbered evidence refs; v1 has no refs, so
-        // its count stays the rows retrieval returned.
-        docCount:
-          pipelineResult !== null
-            ? pipelineResult.evidence.length
-            : context.episodes.length + context.cases.length + context.dcwWiki.length,
-        degradedReason: degradedReasonFor({
-          retrievalFailed,
-          pipeline: pipelineResult,
-          uncited: citations.uncited,
-        }),
-        ...(pipelineResult !== null
-          ? {
-              planSource: pipelineResult.planSource,
-              tools: pipelineResult.toolNames,
-              planMs: pipelineResult.timings.planMs,
-              citationsValid: citations.valid,
-            }
-          : {}),
-      })
-    },
-    cancel() {
-      // The client disconnected. Upstream reads are released inside the
-      // gateway's finally block; the turn still settles so the text that did
-      // arrive is stored rather than lost with the connection.
-      settleAnswer()
     },
   })
 
@@ -625,9 +716,11 @@ export async function POST(request: Request) {
     )
   }
 
-  return new Response(stream, {
+  // The SDK frames the parts as SSE and sets `text/event-stream`; the headers
+  // below are the ones the plain-text response carried, minus its content type.
+  return createUIMessageStreamResponse({
+    stream,
     headers: {
-      "Content-Type": "text/plain; charset=utf-8",
       "Cache-Control": "no-cache, no-store, no-transform",
       Connection: "keep-alive",
       "X-Accel-Buffering": "no",

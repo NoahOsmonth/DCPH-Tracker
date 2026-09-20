@@ -19,12 +19,26 @@
  * provider (constraint 13).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import {
+  isTextUIPart,
+  parseJsonEventStream,
+  readUIMessageStream,
+  uiMessageChunkSchema,
+  type UIMessage,
+} from "ai"
 import { REFUSAL_NO_CONTEXT } from "@/lib/chat/intent"
 import { assembleMessages } from "@/lib/ai/pipeline/assemble"
 import type { PipelineInput, PipelineResult } from "@/lib/ai/pipeline"
 import type { CorpusDocument } from "@/lib/ai/corpus/types"
 import type { ScoredDoc } from "@/lib/ai/retrieval/candidates"
 import type { RequestLogEntry } from "@/lib/ai/request-log"
+import {
+  PARTS,
+  isActivityPart,
+  isCitationsPart,
+  isDegradedPart,
+  isEvidencePart,
+} from "@/lib/ai/stream/protocol"
 
 const getUser = vi.fn()
 const maybeSingle = vi.fn()
@@ -189,6 +203,52 @@ async function readText(response: Response): Promise<string> {
   return await response.text()
 }
 
+/**
+ * The streamed response as the SDK itself reads it, plus its raw wire text.
+ *
+ * `readUIMessageStream` is the clean way to reconstruct a `UIMessage` from the
+ * response rather than hand-parsing SSE: it proves the chunk sequence the route
+ * emits round-trips through the SDK both sides use.
+ */
+async function readStream(response: Response): Promise<{ raw: string; message: UIMessage }> {
+  const raw = await response.clone().text()
+  const body = response.body
+  if (body === null) throw new Error("the response carried no body")
+
+  const chunks = parseJsonEventStream({ stream: body, schema: uiMessageChunkSchema }).pipeThrough(
+    new TransformStream({
+      transform(chunk, controller) {
+        if (!chunk.success) throw chunk.error
+        controller.enqueue(chunk.value)
+      },
+    })
+  )
+
+  let message: UIMessage | undefined
+  for await (const snapshot of readUIMessageStream({ stream: chunks })) message = snapshot
+  if (message === undefined) throw new Error("the response produced no message")
+  return { raw, message }
+}
+
+/** The answer as the reader sees it: every text part, concatenated. */
+function answerText(message: UIMessage): string {
+  return message.parts
+    .filter(isTextUIPart)
+    .map((part) => part.text)
+    .join("")
+}
+
+/** The payload of the first data part of `type`, or undefined. */
+function dataPart(message: UIMessage, type: string): unknown {
+  const part = message.parts.find((candidate) => candidate.type === type)
+  return part === undefined ? undefined : (part as { data?: unknown }).data
+}
+
+/** The index of the first part of `type`, for ordering assertions. */
+function partIndex(message: UIMessage, type: string): number {
+  return message.parts.findIndex((candidate) => candidate.type === type)
+}
+
 /** The messages the gateway actually sent, from the recorded provider request. */
 function sentMessages(fetchMock: ReturnType<typeof vi.fn>): { role: string; content: string }[] {
   const init = fetchMock.mock.calls[0]?.[1] as { body?: string } | undefined
@@ -297,7 +357,8 @@ describe("POST /api/ai-chat through the agentic pipeline", () => {
     const response = await POST(post({ message: USER_MESSAGE }))
 
     expect(response.status).toBe(200)
-    expect(await readText(response)).toBe("She is a former BO scientist [E1].")
+    const { message } = await readStream(response)
+    expect(answerText(message)).toBe("She is a former BO scientist [E1].")
     expect(runPipeline).toHaveBeenCalledTimes(1)
 
     const messages = sentMessages(fetchMock)
@@ -323,8 +384,8 @@ describe("POST /api/ai-chat through the agentic pipeline", () => {
     vi.stubGlobal("fetch", vi.fn(async () => providerResponse(sse("She is a scientist [E1]."))))
     const { POST } = await import("@/app/api/ai-chat/route")
 
-    const text = await readText(await POST(post({ message: USER_MESSAGE })))
-    expect(text).toBe("She is a scientist [E1].")
+    const { message } = await readStream(await POST(post({ message: USER_MESSAGE })))
+    expect(answerText(message)).toBe("She is a scientist [E1].")
 
     const entry = await loggedEntry()
     expect(entry.citationsValid).toBe(true)
@@ -337,11 +398,11 @@ describe("POST /api/ai-chat through the agentic pipeline", () => {
     vi.stubGlobal("fetch", vi.fn(async () => providerResponse(sse(answer))))
     const { POST } = await import("@/app/api/ai-chat/route")
 
-    const body = await readText(await POST(post({ message: USER_MESSAGE })))
+    const { message } = await readStream(await POST(post({ message: USER_MESSAGE })))
 
-    // D3: Phase 4 records, Phase 5 renders. The stream is byte-for-byte what
+    // D3: Phase 4 records, Phase 5 renders. The text part is byte-for-byte what
     // the provider sent.
-    expect(body).toBe(answer)
+    expect(answerText(message)).toBe(answer)
     const entry = await loggedEntry()
     expect(entry.citationsValid).toBe(false)
   })
@@ -357,7 +418,7 @@ describe("POST /api/ai-chat through the agentic pipeline", () => {
     vi.stubGlobal("fetch", vi.fn(async () => providerResponse(sse("Answer [E1]."))))
     const { POST } = await import("@/app/api/ai-chat/route")
 
-    await readText(await POST(post({ message: USER_MESSAGE })))
+    await readStream(await POST(post({ message: USER_MESSAGE })))
 
     const entry = await loggedEntry()
     expect(entry.planSource).toBe("model")
@@ -374,14 +435,20 @@ describe("POST /api/ai-chat through the agentic pipeline", () => {
     vi.stubGlobal("fetch", fetchMock)
     const { POST } = await import("@/app/api/ai-chat/route")
 
-    const text = await readText(await POST(post({ message: USER_MESSAGE })))
+    const { message } = await readStream(await POST(post({ message: USER_MESSAGE })))
 
-    expect(text).toBe("Episode 1 answers it.")
+    expect(answerText(message)).toBe("Episode 1 answers it.")
     expect(searchAll).toHaveBeenCalledTimes(1)
     expect(runPipeline).not.toHaveBeenCalled()
     // No v2 work at all: no watch-history read, no admin client, no pipeline.
     expect(getUserWatchHistory).not.toHaveBeenCalled()
     expect(createAdminClient).not.toHaveBeenCalled()
+    // The v1 shape: activity with nulls, text, and no evidence or citations.
+    const activity = dataPart(message, PARTS.activity)
+    expect(isActivityPart(activity)).toBe(true)
+    expect(activity).toMatchObject({ protocol: 1, planSource: null, tools: [] })
+    expect(dataPart(message, PARTS.evidence)).toBeUndefined()
+    expect(dataPart(message, PARTS.citations)).toBeUndefined()
     // The log row keeps today's shape: the pipeline's fields stay unset.
     const entry = await loggedEntry()
     expect(entry.planSource ?? null).toBeNull()
@@ -398,7 +465,8 @@ describe("POST /api/ai-chat through the agentic pipeline", () => {
     const response = await POST(post({ message: USER_MESSAGE }))
 
     expect(response.status).toBe(200)
-    expect(await readText(response)).toBe(EMPTY_RESULT_MESSAGE)
+    const { message } = await readStream(response)
+    expect(answerText(message)).toBe(EMPTY_RESULT_MESSAGE)
     expect(await loggedEntry()).toMatchObject({ degradedReason: "retrieval_failed" })
     expect(spy.mock.calls.some((call) => String(call[0]).includes("[ai-chat]"))).toBe(true)
     spy.mockRestore()
@@ -425,10 +493,10 @@ describe("POST /api/ai-chat through the agentic pipeline", () => {
     )
     const { POST } = await import("@/app/api/ai-chat/route")
 
-    const text = await readText(await POST(post({ message: USER_MESSAGE })))
+    const { message } = await readStream(await POST(post({ message: USER_MESSAGE })))
     await runAfterTasks()
 
-    expect(text).toContain("cut short")
+    expect(answerText(message)).toContain("cut short")
     const validated = validateCitations.mock.calls[0]?.[0] as { text: string }
     expect(validated.text).toBe("The victim was")
     expect(validated.text).not.toContain("cut short")
@@ -439,10 +507,10 @@ describe("POST /api/ai-chat through the agentic pipeline", () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response("busy", { status: 429 })))
     const { POST } = await import("@/app/api/ai-chat/route")
 
-    const text = await readText(await POST(post({ message: USER_MESSAGE })))
+    const { message } = await readStream(await POST(post({ message: USER_MESSAGE })))
     await runAfterTasks()
 
-    expect(text).toMatch(/at capacity/i)
+    expect(answerText(message)).toMatch(/at capacity/i)
     const validated = validateCitations.mock.calls[0]?.[0] as { text: string }
     expect(validated.text).toBe("")
     expect(persistence.afterTurn).not.toHaveBeenCalled()
@@ -469,7 +537,7 @@ describe("POST /api/ai-chat through the agentic pipeline", () => {
     vi.stubGlobal("fetch", fetchMock)
     const { POST } = await import("@/app/api/ai-chat/route")
 
-    await readText(await POST(post({ message: USER_MESSAGE })))
+    await readStream(await POST(post({ message: USER_MESSAGE })))
 
     const system = sentMessages(fetchMock)[0]
     expect(system?.content).toContain("[MEM] favorite_character: Haibara")
@@ -512,10 +580,95 @@ describe("POST /api/ai-chat through the agentic pipeline", () => {
     const { POST } = await import("@/app/api/ai-chat/route")
 
     const response = await POST(post({ message: USER_MESSAGE }, { signal: controller.signal }))
-    await readText(response)
+    await readStream(response)
 
     expect(toStructuredCall).toHaveBeenCalledTimes(1)
     expect(plannerSignal).toBeDefined()
     expect(plannerSignal?.aborted).toBe(true)
+  })
+
+  it("streams the pipeline's activity, evidence and citation report as parts", async () => {
+    const result = assembledResult(scored(doc(1), doc(2)))
+    runPipeline.mockResolvedValue(result)
+    const answer = "She is a scientist [E1]."
+    vi.stubGlobal("fetch", vi.fn(async () => providerResponse(sse("She is ", "a scientist [E1]."))))
+    const { POST } = await import("@/app/api/ai-chat/route")
+
+    const { message } = await readStream(await POST(post({ message: USER_MESSAGE })))
+
+    const activity = dataPart(message, PARTS.activity)
+    if (!isActivityPart(activity)) throw new Error("no activity part")
+    expect(activity).toEqual({
+      protocol: 1,
+      planSource: "router",
+      tools: ["lookup_character"],
+      timings: { planMs: 7, retrieveMs: 11, assembleMs: 3 },
+    })
+
+    const evidence = dataPart(message, PARTS.evidence)
+    if (!isEvidencePart(evidence)) throw new Error("no evidence part")
+    expect(evidence.refs).toEqual(result.evidence)
+
+    const citations = dataPart(message, PARTS.citations)
+    if (!isCitationsPart(citations)) throw new Error("no citations part")
+    // The report is the real validator's verdict on the answer that streamed,
+    // against the evidence the pipeline actually supplied.
+    expect(citations.report).toEqual(
+      validateCitations({ text: answer, evidence: result.evidence, requireCitation: true })
+    )
+
+    // The gateway's deltas cross the wire byte-for-byte, in one text part.
+    expect(answerText(message)).toBe(answer)
+    // A clean turn reports no degradation at all.
+    expect(dataPart(message, PARTS.degraded)).toBeUndefined()
+  })
+
+  it("sends the pipeline's own degrade reason before the answer", async () => {
+    runPipeline.mockResolvedValue(assembledResult(scored(doc(1)), { degraded: "corpus_static" }))
+    vi.stubGlobal("fetch", vi.fn(async () => providerResponse(sse("Answer [E1]."))))
+    const { POST } = await import("@/app/api/ai-chat/route")
+
+    const { message } = await readStream(await POST(post({ message: USER_MESSAGE })))
+
+    const degraded = dataPart(message, PARTS.degraded)
+    if (!isDegradedPart(degraded)) throw new Error("no degraded part")
+    expect(degraded.reasons).toEqual(["corpus_static"])
+    expect(partIndex(message, PARTS.degraded)).toBeLessThan(partIndex(message, "text"))
+    expect(answerText(message)).toBe("Answer [E1].")
+  })
+
+  it("sends a synthetic degrade part after the text it describes", async () => {
+    // No evidence: this case is about the stream ending, not the citation
+    // contract, so `uncited` cannot be part of the reasons.
+    runPipeline.mockResolvedValue(assembledResult([]))
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        const encoder = new TextEncoder()
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(encoder.encode(sse("The victim was")))
+            },
+            // The error must come from pull(), so the enqueued chunk survives.
+            pull(controller) {
+              controller.error(new Error("connection reset"))
+            },
+          }),
+          { status: 200 }
+        )
+      })
+    )
+    const { POST } = await import("@/app/api/ai-chat/route")
+
+    const { message } = await readStream(await POST(post({ message: USER_MESSAGE })))
+
+    const degraded = dataPart(message, PARTS.degraded)
+    if (!isDegradedPart(degraded)) throw new Error("no degraded part")
+    expect(degraded.reasons).toEqual(["partial_answer"])
+    // Task 4 must apply a late `degraded` part: it arrives after the text it
+    // explains, because the stream's end is what produced it.
+    expect(partIndex(message, PARTS.degraded)).toBeGreaterThan(partIndex(message, "text"))
+    expect(answerText(message)).toContain("cut short")
   })
 })

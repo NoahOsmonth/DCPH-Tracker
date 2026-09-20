@@ -1,5 +1,13 @@
 // app/api/ai-chat/route.integration.test.ts
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import {
+  isTextUIPart,
+  parseJsonEventStream,
+  readUIMessageStream,
+  uiMessageChunkSchema,
+  type UIMessage,
+} from "ai"
+import { PARTS, isActivityPart } from "@/lib/ai/stream/protocol"
 
 const getUser = vi.fn()
 const maybeSingle = vi.fn()
@@ -86,6 +94,45 @@ async function readText(response: Response): Promise<string> {
   return await response.text()
 }
 
+/**
+ * The streamed response as the SDK itself reads it, plus its raw wire text.
+ * The v1 turn is the standing regression test for the transport, so it is
+ * asserted through the same reader the client uses rather than by hand.
+ */
+async function readStream(response: Response): Promise<{ raw: string; message: UIMessage }> {
+  const raw = await response.clone().text()
+  const body = response.body
+  if (body === null) throw new Error("the response carried no body")
+
+  const chunks = parseJsonEventStream({ stream: body, schema: uiMessageChunkSchema }).pipeThrough(
+    new TransformStream({
+      transform(chunk, controller) {
+        if (!chunk.success) throw chunk.error
+        controller.enqueue(chunk.value)
+      },
+    })
+  )
+
+  let message: UIMessage | undefined
+  for await (const snapshot of readUIMessageStream({ stream: chunks })) message = snapshot
+  if (message === undefined) throw new Error("the response produced no message")
+  return { raw, message }
+}
+
+/** The answer as the reader sees it: every text part, concatenated. */
+function answerText(message: UIMessage): string {
+  return message.parts
+    .filter(isTextUIPart)
+    .map((part) => part.text)
+    .join("")
+}
+
+/** The payload of the first data part of `type`, or undefined. */
+function dataPart(message: UIMessage, type: string): unknown {
+  const part = message.parts.find((candidate) => candidate.type === type)
+  return part === undefined ? undefined : (part as { data?: unknown }).data
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
   process.env.AI_PIPELINE = "v1"
@@ -111,7 +158,36 @@ describe("POST /api/ai-chat", () => {
 
     const response = await POST(post({ message: "Who is Haibara?" }))
     expect(response.status).toBe(200)
-    expect(await readText(response)).toBe("Hi there")
+    const { message } = await readStream(response)
+    expect(answerText(message)).toBe("Hi there")
+  })
+
+  it("carries the v1 shape: activity and text, no evidence or citations", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => providerResponse(sse("Hi ", "there"))))
+    const { POST } = await import("@/app/api/ai-chat/route")
+
+    const { raw, message } = await readStream(await POST(post({ message: "Who is Haibara?" })))
+
+    // v1 has no planner and no assembler, so the activity reports nulls rather
+    // than fabricated zeroes; its one real measurement is retrieval's.
+    const activity = dataPart(message, PARTS.activity)
+    if (!isActivityPart(activity)) throw new Error("no activity part")
+    expect(activity).toEqual({
+      protocol: 1,
+      planSource: null,
+      tools: [],
+      timings: { planMs: null, retrieveMs: expect.any(Number), assembleMs: null },
+    })
+
+    // The answer is byte-for-byte what the gateway produced.
+    expect(answerText(message)).toBe("Hi there")
+
+    // A part the server does not send is a part the UI does not show: no
+    // evidence refs and no citation report exist on the v1 path at all.
+    expect(raw).not.toContain("data-evidence")
+    expect(raw).not.toContain("data-citations")
+    expect(message.parts.some((part) => part.type === "data-evidence")).toBe(false)
+    expect(message.parts.some((part) => part.type === "data-citations")).toBe(false)
   })
 
   it("rejects an unauthenticated caller with 401", async () => {
@@ -188,17 +264,17 @@ describe("POST /api/ai-chat", () => {
     )
     const { POST } = await import("@/app/api/ai-chat/route")
 
-    const text = await readText(await POST(post({ message: "Who is Haibara?" })))
-    expect(text).toContain("The victim was")
-    expect(text).toContain("cut short")
+    const { message } = await readStream(await POST(post({ message: "Who is Haibara?" })))
+    expect(answerText(message)).toContain("The victim was")
+    expect(answerText(message)).toContain("cut short")
   })
 
   it("reports capacity exhaustion when every provider is rate limited", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response("busy", { status: 429 })))
     const { POST } = await import("@/app/api/ai-chat/route")
 
-    const text = await readText(await POST(post({ message: "Who is Haibara?" })))
-    expect(text).toMatch(/at capacity/i)
+    const { message } = await readStream(await POST(post({ message: "Who is Haibara?" })))
+    expect(answerText(message)).toMatch(/at capacity/i)
   })
 
   it("falls over to the next model when the first returns empty content", async () => {
@@ -215,8 +291,8 @@ describe("POST /api/ai-chat", () => {
     )
     const { POST } = await import("@/app/api/ai-chat/route")
 
-    const text = await readText(await POST(post({ message: "Who is Haibara?" })))
-    expect(text).toBe("Second model answered")
+    const { message } = await readStream(await POST(post({ message: "Who is Haibara?" })))
+    expect(answerText(message)).toBe("Second model answered")
   })
 
   it("rejects an oversized message with 400", async () => {

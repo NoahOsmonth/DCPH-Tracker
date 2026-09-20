@@ -15,6 +15,7 @@ import {
   Pencil,
   RefreshCw,
   History,
+  Brain,
 } from "lucide-react"
 import type { ChatTransport, UIMessage } from "ai"
 import { cn } from "@/lib/utils"
@@ -29,6 +30,7 @@ import {
   ConversationDrawer,
   type TranscriptMessage,
 } from "@/components/chat/ConversationDrawer"
+import { MemoryPanel } from "@/components/chat/MemoryPanel"
 import { createClient } from "@/utils/supabase/client"
 import { openAuthModal } from "@/lib/auth-modal"
 import { useCharacterChromeHidden } from "@/lib/character-chrome"
@@ -48,6 +50,12 @@ import type { User as SupabaseUser } from "@supabase/supabase-js"
  * it hands its loaded rows to `loadConversation`, which replaces what is on
  * screen rather than appending to it. The drawer's `open` state lives here, next
  * to the panel's Escape handler, because Escape must reach only one of them.
+ *
+ * The memory panel is the second overlay and follows the same shape: it is
+ * prop-driven, its `open` state is owned here, and it renders as a sibling of the
+ * transcript rather than inside it. Both overlays are Radix dialogs, so Escape is
+ * theirs while either is open — hence `overlayOpen` below rather than a flag per
+ * overlay.
  *
  * Nothing in this file knows a provider, a key or a route: the only address in
  * the client path is the hook's `/api/ai-chat`.
@@ -128,6 +136,14 @@ export function ChatWidget({ transport }: ChatWidgetProps = {}) {
   // Escape handler is here and the two must not fight: while the drawer is open
   // Escape belongs to the drawer.
   const [drawerOpen, setDrawerOpen] = React.useState(false)
+  // The memory panel is the second overlay and is owned here for the same
+  // reason: it is opened by a header control, and Escape must reach only one of
+  // the two dialogs at a time.
+  const [memoryOpen, setMemoryOpen] = React.useState(false)
+  // Every overlay the widget can put over the panel, derived rather than kept as
+  // its own boolean: a third overlay only has to join this expression, so it
+  // cannot silently reintroduce the Escape bug by forgetting a fresh flag.
+  const overlayOpen = drawerOpen || memoryOpen
   // Escape closes the panel, but not while an answer is arriving: there it is
   // the reader's stop control, and closing would take the partial answer off
   // screen at the moment it was asked to stop. The flag lives in a ref because
@@ -173,9 +189,11 @@ export function ChatWidget({ transport }: ChatWidgetProps = {}) {
   React.useEffect(() => {
     if (!open) {
       setMounted(false)
-      // The drawer is a portal over the panel: closing the panel must take it
-      // with it, or it would hang over a panel that is no longer there.
+      // The drawer and the memory panel are portals over the panel: closing the
+      // panel must take them with it, or they would hang over a panel that is no
+      // longer there.
       setDrawerOpen(false)
+      setMemoryOpen(false)
       return
     }
     const frame = requestAnimationFrame(() => setMounted(true))
@@ -185,15 +203,16 @@ export function ChatWidget({ transport }: ChatWidgetProps = {}) {
   React.useEffect(() => {
     if (!open) return
     const onKeyDown = (event: KeyboardEvent) => {
-      // The drawer is a Radix dialog and handles Escape itself, but its dismiss
-      // does not stop the event, so this window listener would otherwise close
-      // the panel underneath it. While the drawer is open, Escape is the
-      // drawer's alone.
-      if (event.key === "Escape" && !streamingRef.current && !drawerOpen) setOpen(false)
+      // The drawer and the memory panel are Radix dialogs and handle Escape
+      // themselves, but their dismiss calls `preventDefault()` and not
+      // `stopPropagation()`, so this window listener would otherwise close the
+      // panel underneath them. While any overlay is open, Escape is the
+      // overlay's alone.
+      if (event.key === "Escape" && !streamingRef.current && !overlayOpen) setOpen(false)
     }
     window.addEventListener("keydown", onKeyDown)
     return () => window.removeEventListener("keydown", onKeyDown)
-  }, [open, drawerOpen])
+  }, [open, overlayOpen])
 
   return (
     <>
@@ -258,6 +277,18 @@ export function ChatWidget({ transport }: ChatWidgetProps = {}) {
                   >
                     <History className="size-4" />
                   </button>
+                  {/* The memory panel's own opener, for the same reason as the
+                      drawer's: the panel is a Radix dialog opened by a control
+                      outside it, so this real button is what focus returns to. */}
+                  <button
+                    type="button"
+                    onClick={() => setMemoryOpen(true)}
+                    aria-label="What the bot remembers"
+                    title="What the bot remembers"
+                    className="rounded-lg p-1.5 text-ink-faint transition-colors hover:bg-surface-muted hover:text-ink"
+                  >
+                    <Brain className="size-4" />
+                  </button>
                   <button
                     type="button"
                     onClick={() => setSessionKey((key) => key + 1)}
@@ -307,6 +338,8 @@ export function ChatWidget({ transport }: ChatWidgetProps = {}) {
               onStreamingChange={setStreaming}
               drawerOpen={drawerOpen}
               onDrawerOpenChange={setDrawerOpen}
+              memoryOpen={memoryOpen}
+              onMemoryOpenChange={setMemoryOpen}
             />
           )}
         </div>
@@ -327,6 +360,8 @@ function ChatSession({
   onStreamingChange,
   drawerOpen,
   onDrawerOpenChange,
+  memoryOpen,
+  onMemoryOpenChange,
 }: {
   transport?: ChatTransport<UIMessage>
   /** Tells the panel whether Escape means "stop" or "close" right now. */
@@ -334,6 +369,9 @@ function ChatSession({
   /** Owned by the widget, because the panel's Escape handler lives there too. */
   drawerOpen: boolean
   onDrawerOpenChange: (open: boolean) => void
+  /** The second overlay, owned by the widget for the same reason as the drawer. */
+  memoryOpen: boolean
+  onMemoryOpenChange: (open: boolean) => void
 }) {
   const {
     messages,
@@ -482,6 +520,11 @@ function ChatSession({
         activeConversationId={conversationId}
         onSelect={openConversation}
       />
+
+      {/* The memory panel is the second overlay and follows the same rule: a
+          sibling of the transcript and the composer, never inside the region
+          that scrolls. */}
+      <MemoryPanel open={memoryOpen} onOpenChange={onMemoryOpenChange} />
     </>
   )
 }

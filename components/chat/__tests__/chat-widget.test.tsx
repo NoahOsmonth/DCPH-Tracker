@@ -1,5 +1,5 @@
 import * as React from "react"
-import { act, render, screen, waitFor } from "@testing-library/react"
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { ChatTransport, UIMessage, UIMessageChunk } from "ai"
@@ -172,14 +172,28 @@ const DRAWER_TRANSCRIPT = [
   },
 ]
 
+/** One fact, in the shape `GET /api/ai-chat/memory` answers with. */
+const MEMORY_FACT = {
+  id: "11111111-1111-4111-8111-111111111111",
+  kind: "preference",
+  key: "favorite_character",
+  value: "Bourbon",
+  confidence: 0.9,
+  lastConfirmedAt: Date.now() - 3 * 60 * 60 * 1000,
+  status: "active",
+}
+
 /**
- * One `fetch` for both the drawer's reads and the hook's chat POST. The drawer
- * is the only thing here that touches the network besides the chat route, so a
- * single stub keeps the two apart by URL and lets a test watch the request body.
+ * One `fetch` for the drawer's reads, the memory panel's list and the hook's
+ * chat POST. Those are the only things here that touch the network, so a single
+ * stub keeps them apart by URL and lets a test watch the request body.
  */
 function stubRoutes(chatChunks: UIMessageChunk[] = completeTurnChunks("live answer")) {
   const fetchMock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
     const url = String(input)
+    if (url.includes("/api/ai-chat/memory")) {
+      return jsonResponse({ facts: [MEMORY_FACT], cap: 50, memoryEnabled: true })
+    }
     if (url.includes("/api/ai-chat/conversations")) {
       if (url.includes("?id=")) {
         return jsonResponse({ id: DRAWER_ID, title: "Bourbon trivia", messages: DRAWER_TRANSCRIPT })
@@ -205,7 +219,10 @@ function stubRoutes(chatChunks: UIMessageChunk[] = completeTurnChunks("live answ
 /** The chat POSTs among the stub's calls, newest last. */
 function chatBodies(fetchMock: ReturnType<typeof stubRoutes>) {
   return fetchMock.mock.calls
-    .filter((call) => String(call[0]).includes("/api/ai-chat") && !String(call[0]).includes("conversations"))
+    .filter((call) => {
+      const url = String(call[0])
+      return url.includes("/api/ai-chat") && !url.includes("conversations") && !url.includes("memory")
+    })
     .map((call) => JSON.parse(String(call[1]?.body)) as { conversationId?: string })
 }
 
@@ -623,5 +640,72 @@ describe("the conversation drawer", () => {
       expect(screen.queryByRole("dialog", { name: "Conversations" })).not.toBeInTheDocument()
     )
     expect(screen.getByRole("dialog", { name: "DCPH Bot — episode finder" })).toBeInTheDocument()
+  })
+})
+
+describe("the memory panel", () => {
+  /** The header control and the dialog share a name; the role tells them apart. */
+  const MEMORY_CONTROL = "What the bot remembers"
+
+  it("opens the memory panel from its header control", async () => {
+    stubRoutes()
+    const user = await renderWidget(scriptedTransport(() => completeTurnChunks("x")).transport)
+
+    const control = screen.getByRole("button", { name: MEMORY_CONTROL })
+    expect(control).toHaveAttribute("title", MEMORY_CONTROL)
+
+    await user.click(control)
+
+    expect(await screen.findByRole("dialog", { name: MEMORY_CONTROL })).toBeInTheDocument()
+    // The list is the server's: the control opened a panel that loaded it.
+    expect(await screen.findByText("favorite_character")).toBeInTheDocument()
+  })
+
+  it("hides the header control from a signed-out reader", async () => {
+    mocks.user = null
+    const user = userEvent.setup()
+    render(<ChatWidget />)
+    await user.click(screen.getByRole("button", { name: "Open DCPH Bot" }))
+    await screen.findByText("Member Access Only")
+
+    expect(screen.queryByRole("button", { name: MEMORY_CONTROL })).not.toBeInTheDocument()
+  })
+
+  it("lets Escape close the memory panel without closing the chat panel", async () => {
+    stubRoutes()
+    const user = await renderWidget(scriptedTransport(() => completeTurnChunks("x")).transport)
+
+    await user.click(screen.getByRole("button", { name: MEMORY_CONTROL }))
+    await screen.findByRole("dialog", { name: MEMORY_CONTROL })
+
+    await user.keyboard("{Escape}")
+
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: MEMORY_CONTROL })).not.toBeInTheDocument()
+    )
+    expect(screen.getByRole("dialog", { name: "DCPH Bot — episode finder" })).toBeInTheDocument()
+  })
+
+  it("closes the memory panel with the chat panel, so no portal outlives it", async () => {
+    stubRoutes()
+    const user = await renderWidget(scriptedTransport(() => completeTurnChunks("x")).transport)
+
+    await user.click(screen.getByRole("button", { name: MEMORY_CONTROL }))
+    await screen.findByRole("dialog", { name: MEMORY_CONTROL })
+
+    // The memory dialog is modal, so while it is open the panel's own controls
+    // sit outside the accessibility tree and no pointer can reach them. The
+    // close is dispatched straight at the button: the requirement is that
+    // closing the panel takes its overlay with it, by whichever path `open`
+    // became false.
+    fireEvent.click(screen.getByRole("button", { name: "Close chat", hidden: true }))
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+
+    // Reopening starts with the panel alone: the memory dialog did not survive
+    // the panel it belonged to.
+    await user.click(screen.getByRole("button", { name: "Open DCPH Bot" }))
+    await screen.findByRole("dialog", { name: "DCPH Bot — episode finder" })
+    expect(screen.queryByRole("dialog", { name: MEMORY_CONTROL })).not.toBeInTheDocument()
   })
 })

@@ -222,6 +222,12 @@ describe("pipeline recall gate", () => {
     "clears the recall@5 gate over the assembled evidence",
     async () => {
       const report = await evaluateRetrieval(cases, throughPipeline)
+      // The measured number on one line, before the gate: `npm run test:eval`
+      // exists so a CI log shows this value, and a failing run shows the number
+      // that failed rather than only the assertion's message (plan D4).
+      console.log(
+        `pipeline-level recall ${report.recallAt5.toFixed(4)} (${report.passed}/${report.total}) ≥ ${RECALL_GATE}`
+      )
       // The failing questions travel in the assertion message, so a regression
       // is diagnosable from CI output alone.
       const misses = JSON.stringify(report.misses.map((miss) => miss.q))

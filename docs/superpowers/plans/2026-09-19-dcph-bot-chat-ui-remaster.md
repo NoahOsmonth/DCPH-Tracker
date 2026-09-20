@@ -277,6 +277,62 @@ net). This keeps a hand-built or partial stream testable without inventing a ver
 `tsc` exit 0; lint 0 errors / 14 warnings; build succeeds with the four `/api/ai-chat*` bundles, and
 `/community/chat`'s first load is unchanged at 110 kB because nothing imports the hook yet.
 
+**C17 — Task 1's `matchMedia` stub did not answer framer-motion.** The stub matched only
+`"(prefers-reduced-motion: reduce)"` by equality, but framer-motion's `useReducedMotion()` asks the
+boolean form `"(prefers-reduced-motion)"` (verified in
+`node_modules/framer-motion/dist/es/utils/reduced-motion/index.mjs`). So framer-motion saw *no*
+preference under jsdom and every reduced-motion assertion would have tested the animated branch
+while looking green — including all of Task 11's. Fixed in `cc082a7`: the stub now matches any query
+naming `prefers-reduced-motion` that is not `no-preference`, and Task 5's local workaround was
+removed with it. The framer-motion dev warning now fires in the dom project, which is the visible
+proof the hook reads `reduce`.
+
+**C18 — Task 6 item 1's "summed" duration double-counts the plan stage.** The pipeline measures
+`retrieveMs` over a window that *contains* the planner (`lib/ai/pipeline/index.ts`'s
+`retrieveStartedAt` block: "resolve + plan + execute: `retrieveMs` covers all three"), so
+`planMs + retrieveMs + assembleMs` reports a duration longer than the request took. `totalActivityMs`
+now takes the wider window (`retrieveMs ?? planMs`) plus `assembleMs` and never adds the two
+(commit `70ffdfe`); the expanded list labels the stage "Retrieve (includes plan)" so the containment
+is visible to the reader, and `planMs` remains a breakdown rather than a sibling. The server's
+`PipelineTimings` shape is unchanged — the fix is in the renderer, and the containment is now
+documented on both sides.
+
+**C19 — Task 6 item 2's reason list is stale: it names 11 and omits the three synthetic tokens.** The
+authority is `DEGRADED_REASONS` (14). The wording table is typed
+`Record<DegradedReason, string>`, so adding a 15th reason to the vocabulary fails `tsc` until it is
+worded, and the test iterates the imported constant rather than a hand-written list.
+
+**C20 — `activity === null` also means no degrade badges, and that is safe.** The view model clears
+`degraded` whenever it discards an unknown-version activity part, and v1 always writes an activity
+part (the route writes it unconditionally), so the only activity-null turns carry no reasons either.
+Recorded so a later reader does not think a degrade can be silently dropped.
+
+**C21 — Task 6 item 4's "name that says what it does" needs more than the summary.** The trace's
+toggle is a `button` whose accessible name is the visible summary plus an `sr-only`
+"Show details"/"Hide details", so it says both what happened and what the control does.
+
+**C22 — Item 5's banned tier variants leave one variant for degrade badges.** Task 5 uses
+`default`/`secondary`/`gold` for `[RET]`/`[WIKI]`/`[CONV]`, so every degrade badge is `outline`,
+known and unknown alike; the wording, not the tone, is what distinguishes them. A second tone would
+need a palette change, which constraint 12 forbids.
+
+**C23 — Task 7 must be strictly additive to `ChatMessage.tsx`, and the plan's Task 7 file list
+misses the feedback controls' home.** `ChatMessage` is imported by `ChatWidget.tsx`
+(`{ message: ChatMessageData, isStreaming }`) and that file is frozen until the user commits, so
+changing `ChatMessage`'s props would break the build. The parts rendering therefore layers onto the
+existing component as optional props, and today's caller renders byte-identically. §4's architecture
+diagram already lists `FeedbackControls` under `components/chat/`, so it gets its own file even
+though §6's Task 7 line names only `ChatMessage.tsx`.
+
+**C24 — Task 7 and Task 6 would both badge a synthetic ending.** `degraded` carries the synthetic
+tokens and `ActivityTrace` renders a badge per reason, so a rate-limited turn would show "the bot was
+rate-limited" from the trace *and* Task 7's D5 state badge. Task 7 owns the D5 badge and filters
+`SYNTHETIC_STATE_REASONS` out of the `degraded` list it hands the trace, so each state is said once.
+
+**Verified at Tasks 5 and 6's close** (`8d2ece4`, `cc082a7`, `d03bd6d`, `70ffdfe`): 83 files /
+1,325 tests (node 79/1,250, dom 4/75); `tsc` exit 0; lint 0 errors / 14 warnings; build succeeds with
+the four `/api/ai-chat*` bundles and `/community/chat` unchanged at 110 kB.
+
 ## 6. Task index
 
 | # | Task | Files | Commit |

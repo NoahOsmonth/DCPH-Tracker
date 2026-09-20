@@ -146,6 +146,76 @@ async function renderWidget(transport?: ChatTransport<UIMessage>): Promise<User>
   return user
 }
 
+/** A scripted SSE response, the framing the hook's default transport parses. */
+function sseResponse(chunks: UIMessageChunk[]): Response {
+  const body = chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("") + "data: [DONE]\n\n"
+  return new Response(body, {
+    status: 200,
+    headers: { "content-type": "text/event-stream" },
+  })
+}
+
+function jsonResponse(body: unknown): Response {
+  return new Response(JSON.stringify(body), { status: 200 })
+}
+
+const DRAWER_ID = "33333333-3333-4333-8333-333333333333"
+
+/** A stored conversation, as the route's two reads answer it. */
+const DRAWER_TRANSCRIPT = [
+  { id: "m1", role: "user", content: "Who is Bourbon?", createdAt: Date.now() - 60_000 },
+  {
+    id: "m2",
+    role: "assistant",
+    content: "A member of the Black Organization.",
+    createdAt: Date.now() - 30_000,
+  },
+]
+
+/**
+ * One `fetch` for both the drawer's reads and the hook's chat POST. The drawer
+ * is the only thing here that touches the network besides the chat route, so a
+ * single stub keeps the two apart by URL and lets a test watch the request body.
+ */
+function stubRoutes(chatChunks: UIMessageChunk[] = completeTurnChunks("live answer")) {
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
+    const url = String(input)
+    if (url.includes("/api/ai-chat/conversations")) {
+      if (url.includes("?id=")) {
+        return jsonResponse({ id: DRAWER_ID, title: "Bourbon trivia", messages: DRAWER_TRANSCRIPT })
+      }
+      return jsonResponse({
+        conversations: [
+          {
+            id: DRAWER_ID,
+            title: "Bourbon trivia",
+            messageCount: 2,
+            lastMessageAt: Date.now() - 30_000,
+            archivedAt: null,
+          },
+        ],
+      })
+    }
+    return sseResponse(chatChunks)
+  })
+  vi.stubGlobal("fetch", fetchMock)
+  return fetchMock
+}
+
+/** The chat POSTs among the stub's calls, newest last. */
+function chatBodies(fetchMock: ReturnType<typeof stubRoutes>) {
+  return fetchMock.mock.calls
+    .filter((call) => String(call[0]).includes("/api/ai-chat") && !String(call[0]).includes("conversations"))
+    .map((call) => JSON.parse(String(call[1]?.body)) as { conversationId?: string })
+}
+
+/** Open the drawer from its header control and wait for the server's list. */
+async function openDrawer(user: User): Promise<void> {
+  await user.click(screen.getByRole("button", { name: "Your conversations" }))
+  await screen.findByRole("dialog", { name: "Conversations" })
+  await screen.findByRole("button", { name: /^Bourbon trivia/ })
+}
+
 /** Type a turn into the composer and send it. */
 async function sendText(user: User, text: string): Promise<void> {
   const box = screen.getByRole("textbox", { name: /ask about detective conan episodes/i })
@@ -467,5 +537,91 @@ describe("starting a new conversation", () => {
     expect(screen.queryByText("Hello world")).not.toBeInTheDocument()
     expect(screen.queryByText("hi")).not.toBeInTheDocument()
     expect(screen.getByText("Suggested questions:")).toBeInTheDocument()
+  })
+})
+
+describe("the conversation drawer", () => {
+  it("offers the header control to a signed-in reader", async () => {
+    const user = await renderWidget(scriptedTransport(() => completeTurnChunks("x")).transport)
+
+    expect(screen.getByRole("button", { name: "Your conversations" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "Start a new conversation" })).toBeInTheDocument()
+  })
+
+  it("hides the header control from a signed-out reader", async () => {
+    mocks.user = null
+    const user = userEvent.setup()
+    render(<ChatWidget />)
+    await user.click(screen.getByRole("button", { name: "Open DCPH Bot" }))
+    await screen.findByText("Member Access Only")
+
+    expect(screen.queryByRole("button", { name: "Your conversations" })).not.toBeInTheDocument()
+  })
+
+  it("opens the drawer from the header control", async () => {
+    stubRoutes()
+    const user = await renderWidget(scriptedTransport(() => completeTurnChunks("x")).transport)
+
+    await openDrawer(user)
+
+    expect(screen.getByRole("dialog", { name: "Conversations" })).toBeInTheDocument()
+  })
+
+  it("replaces the transcript on screen rather than appending the loaded one", async () => {
+    stubRoutes()
+    const user = await renderWidget(
+      scriptedTransport(() => completeTurnChunks("live answer")).transport
+    )
+
+    await sendText(user, "live question")
+    await screen.findByText("live answer")
+
+    await openDrawer(user)
+    await user.click(screen.getByRole("button", { name: /^Bourbon trivia/ }))
+
+    expect(await screen.findByText("A member of the Black Organization.")).toBeInTheDocument()
+    expect(screen.getByText("Who is Bourbon?")).toBeInTheDocument()
+    // The turn that was on screen is gone: a load replaces, it does not append.
+    expect(screen.queryByText("live answer")).not.toBeInTheDocument()
+    expect(screen.queryByText("live question")).not.toBeInTheDocument()
+  })
+
+  it("posts a turn sent after a selection with that conversation's id", async () => {
+    const fetchMock = stubRoutes(completeTurnChunks("follow-up answer"))
+    const user = await renderWidget()
+
+    await openDrawer(user)
+    await user.click(screen.getByRole("button", { name: /^Bourbon trivia/ }))
+    await screen.findByText("A member of the Black Organization.")
+
+    await sendText(user, "follow up")
+    await screen.findByText("follow-up answer")
+
+    expect(chatBodies(fetchMock).at(-1)?.conversationId).toBe(DRAWER_ID)
+  })
+
+  it("closes the drawer after a selection", async () => {
+    stubRoutes()
+    const user = await renderWidget(scriptedTransport(() => completeTurnChunks("x")).transport)
+
+    await openDrawer(user)
+    await user.click(screen.getByRole("button", { name: /^Bourbon trivia/ }))
+
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "Conversations" })).not.toBeInTheDocument()
+    )
+  })
+
+  it("lets Escape close the drawer without closing the panel", async () => {
+    stubRoutes()
+    const user = await renderWidget(scriptedTransport(() => completeTurnChunks("x")).transport)
+
+    await openDrawer(user)
+    await user.keyboard("{Escape}")
+
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "Conversations" })).not.toBeInTheDocument()
+    )
+    expect(screen.getByRole("dialog", { name: "DCPH Bot — episode finder" })).toBeInTheDocument()
   })
 })

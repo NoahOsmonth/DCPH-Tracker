@@ -12,8 +12,10 @@ import {
   toChatRequestBody,
   toMessageView,
   toMessageViews,
+  transcriptToUIMessages,
   useChatStream,
   type StreamViewContext,
+  type TranscriptMessageLike,
 } from "@/components/chat/useChatStream"
 
 // The jsdom project has no .env.local and must not reach a socket, so every
@@ -29,6 +31,12 @@ const IDLE: StreamViewContext = { streamingMessageId: null, stoppedMessageId: nu
 
 const REF: EvidenceRef = { n: 1, id: "ep-1", tag: "[RET]", label: "Episode 1" }
 const REPORT: CitationReport = { cited: [REF], unknown: [], valid: true, uncited: false }
+
+/** A stored transcript, as the drawer hands it back. */
+const STORED_ROWS: TranscriptMessageLike[] = [
+  { id: "s1", role: "user", content: "Who is Bourbon?" },
+  { id: "s2", role: "assistant", content: "A member of the Black Organization." },
+]
 
 function textPart(text: string): Part {
   return { type: "text", text }
@@ -357,6 +365,32 @@ describe("toChatRequestBody", () => {
   })
 })
 
+describe("transcriptToUIMessages", () => {
+  it("maps stored rows to text-only parts, in order and with their ids", () => {
+    const messages = transcriptToUIMessages(STORED_ROWS)
+
+    expect(messages).toEqual([
+      { id: "s1", role: "user", parts: [{ type: "text", text: "Who is Bourbon?" }] },
+      {
+        id: "s2",
+        role: "assistant",
+        parts: [{ type: "text", text: "A member of the Black Organization." }],
+      },
+    ])
+  })
+
+  it("keeps a row whose content is empty rather than dropping it", () => {
+    // A dropped row would silently change the history the server is told about.
+    const messages = transcriptToUIMessages([
+      { id: "s1", role: "user", content: "" },
+      { id: "s2", role: "assistant", content: "answer" },
+    ])
+
+    expect(messages.map((message) => message.id)).toEqual(["s1", "s2"])
+    expect(messages[0].parts).toEqual([{ type: "text", text: "" }])
+  })
+})
+
 describe("useChatStream", () => {
   it("streams a turn and settles it to complete", async () => {
     const { transport, calls } = scriptedTransport(() => completeTurnChunks())
@@ -523,5 +557,85 @@ describe("useChatStream", () => {
     })
 
     expect(result.current.conversationId).toBeNull()
+  })
+
+  it("loads a stored transcript by replacing the one on screen, not appending", async () => {
+    const { transport } = scriptedTransport(() => completeTurnChunks("live answer"))
+    const { result } = renderHook(() => useChatStream({ transport }))
+
+    await act(async () => {
+      await result.current.send("live question")
+    })
+    expect(result.current.messages).toHaveLength(2)
+
+    act(() => {
+      result.current.loadConversation("conv-loaded", transcriptToUIMessages(STORED_ROWS))
+    })
+
+    expect(result.current.messages.map((message) => [message.id, message.role, message.text])).toEqual(
+      [
+        ["s1", "user", "Who is Bourbon?"],
+        ["s2", "assistant", "A member of the Black Organization."],
+      ]
+    )
+    expect(result.current.conversationId).toBe("conv-loaded")
+  })
+
+  it("returns to idle and un-marks a stopped turn when a transcript is loaded", async () => {
+    const { transport, push } = controllableTransport()
+    const { result } = renderHook(() => useChatStream({ transport }))
+
+    let sending: Promise<void> = Promise.resolve()
+    await act(async () => {
+      sending = result.current.send("hello")
+    })
+    await act(async () => {
+      push({ type: "text-start", id: "answer" })
+      push({ type: "text-delta", id: "answer", delta: "partial" })
+    })
+    await act(async () => {
+      result.current.stop()
+      await sending
+    })
+
+    expect(result.current.status).toBe("stopped")
+    expect(result.current.messages.at(-1)?.state).toEqual({ kind: "stopped" })
+
+    act(() => {
+      result.current.loadConversation("conv-loaded", transcriptToUIMessages(STORED_ROWS))
+    })
+
+    // `stopped` is the hook's own flag and names the last assistant turn, so it
+    // must not survive a load: the loaded final answer was never stopped.
+    expect(result.current.status).toBe("idle")
+    expect(result.current.messages.at(-1)?.state).toEqual({ kind: "complete" })
+  })
+
+  it("posts a turn sent after a load with the loaded conversation id", async () => {
+    const fetchMock = vi.fn(
+      async (_input: RequestInfo | URL, _init?: RequestInit) => sseResponse(completeTurnChunks())
+    )
+    vi.stubGlobal("fetch", fetchMock)
+    const { result } = renderHook(() => useChatStream({}))
+
+    // Load and send in the same tick: the transport reads the id from a ref, and
+    // a state update has not committed by the time the turn is prepared.
+    await act(async () => {
+      result.current.loadConversation("conv-loaded", transcriptToUIMessages(STORED_ROWS))
+      await result.current.send("follow up")
+    })
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body)) as {
+      message: string
+      history: { role: string; content: string }[]
+      conversationId?: string
+    }
+    expect(body.conversationId).toBe("conv-loaded")
+    expect(body.message).toBe("follow up")
+    // The loaded transcript is the history the route is told about.
+    expect(body.history).toEqual([
+      { role: "user", content: "Who is Bourbon?" },
+      { role: "assistant", content: "A member of the Black Organization." },
+    ])
   })
 })

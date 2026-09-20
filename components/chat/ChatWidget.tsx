@@ -14,12 +14,21 @@ import {
   Film,
   Pencil,
   RefreshCw,
+  History,
 } from "lucide-react"
 import type { ChatTransport, UIMessage } from "ai"
 import { cn } from "@/lib/utils"
 import { ChatInput } from "@/components/chat/ChatInput"
 import { ChatMessage, TypingDots } from "@/components/chat/ChatMessage"
-import { useChatStream, type ChatMessageView } from "@/components/chat/useChatStream"
+import {
+  useChatStream,
+  transcriptToUIMessages,
+  type ChatMessageView,
+} from "@/components/chat/useChatStream"
+import {
+  ConversationDrawer,
+  type TranscriptMessage,
+} from "@/components/chat/ConversationDrawer"
 import { createClient } from "@/utils/supabase/client"
 import { openAuthModal } from "@/lib/auth-modal"
 import { useCharacterChromeHidden } from "@/lib/character-chrome"
@@ -34,6 +43,11 @@ import type { User as SupabaseUser } from "@supabase/supabase-js"
  * request shape, the conversation id, the parts→view mapping and the `stopped`
  * state the SDK's own status cannot express. What is left here is presentation
  * plus the two turn controls the parts path does not carry (edit, regenerate).
+ *
+ * The conversation drawer is the one way a stored transcript re-enters the hook:
+ * it hands its loaded rows to `loadConversation`, which replaces what is on
+ * screen rather than appending to it. The drawer's `open` state lives here, next
+ * to the panel's Escape handler, because Escape must reach only one of them.
  *
  * Nothing in this file knows a provider, a key or a route: the only address in
  * the client path is the hook's `/api/ai-chat`.
@@ -110,6 +124,10 @@ export function ChatWidget({ transport }: ChatWidgetProps = {}) {
   // with it, so the next turn opens a new server conversation rather than
   // appending to the one just abandoned.
   const [sessionKey, setSessionKey] = React.useState(0)
+  // The drawer is opened by a header control and owned here, because the panel's
+  // Escape handler is here and the two must not fight: while the drawer is open
+  // Escape belongs to the drawer.
+  const [drawerOpen, setDrawerOpen] = React.useState(false)
   // Escape closes the panel, but not while an answer is arriving: there it is
   // the reader's stop control, and closing would take the partial answer off
   // screen at the moment it was asked to stop. The flag lives in a ref because
@@ -155,6 +173,9 @@ export function ChatWidget({ transport }: ChatWidgetProps = {}) {
   React.useEffect(() => {
     if (!open) {
       setMounted(false)
+      // The drawer is a portal over the panel: closing the panel must take it
+      // with it, or it would hang over a panel that is no longer there.
+      setDrawerOpen(false)
       return
     }
     const frame = requestAnimationFrame(() => setMounted(true))
@@ -164,11 +185,15 @@ export function ChatWidget({ transport }: ChatWidgetProps = {}) {
   React.useEffect(() => {
     if (!open) return
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !streamingRef.current) setOpen(false)
+      // The drawer is a Radix dialog and handles Escape itself, but its dismiss
+      // does not stop the event, so this window listener would otherwise close
+      // the panel underneath it. While the drawer is open, Escape is the
+      // drawer's alone.
+      if (event.key === "Escape" && !streamingRef.current && !drawerOpen) setOpen(false)
     }
     window.addEventListener("keydown", onKeyDown)
     return () => window.removeEventListener("keydown", onKeyDown)
-  }, [open])
+  }, [open, drawerOpen])
 
   return (
     <>
@@ -219,15 +244,30 @@ export function ChatWidget({ transport }: ChatWidgetProps = {}) {
 
             <div className="flex shrink-0 items-center gap-1">
               {user && (
-                <button
-                  type="button"
-                  onClick={() => setSessionKey((key) => key + 1)}
-                  aria-label="Start a new conversation"
-                  title="New conversation"
-                  className="rounded-lg p-1.5 text-ink-faint transition-colors hover:bg-surface-muted hover:text-ink"
-                >
-                  <RotateCcw className="size-4" />
-                </button>
+                <>
+                  {/* The drawer's own opener: Radix restores focus only to a
+                      `DialogTrigger`, and the drawer captures and restores
+                      whatever opened it, so this real button is the control
+                      that focus comes back to. */}
+                  <button
+                    type="button"
+                    onClick={() => setDrawerOpen(true)}
+                    aria-label="Your conversations"
+                    title="Your conversations"
+                    className="rounded-lg p-1.5 text-ink-faint transition-colors hover:bg-surface-muted hover:text-ink"
+                  >
+                    <History className="size-4" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSessionKey((key) => key + 1)}
+                    aria-label="Start a new conversation"
+                    title="New conversation"
+                    className="rounded-lg p-1.5 text-ink-faint transition-colors hover:bg-surface-muted hover:text-ink"
+                  >
+                    <RotateCcw className="size-4" />
+                  </button>
+                </>
               )}
               <button
                 type="button"
@@ -261,7 +301,13 @@ export function ChatWidget({ transport }: ChatWidgetProps = {}) {
           ) : (
             // Remounting on `sessionKey` is the only reset the hook offers: it
             // owns the transcript, so a new conversation is a new hook.
-            <ChatSession key={sessionKey} transport={transport} onStreamingChange={setStreaming} />
+            <ChatSession
+              key={sessionKey}
+              transport={transport}
+              onStreamingChange={setStreaming}
+              drawerOpen={drawerOpen}
+              onDrawerOpenChange={setDrawerOpen}
+            />
           )}
         </div>
       )}
@@ -279,14 +325,41 @@ export function ChatWidget({ transport }: ChatWidgetProps = {}) {
 function ChatSession({
   transport,
   onStreamingChange,
+  drawerOpen,
+  onDrawerOpenChange,
 }: {
   transport?: ChatTransport<UIMessage>
   /** Tells the panel whether Escape means "stop" or "close" right now. */
   onStreamingChange: (streaming: boolean) => void
+  /** Owned by the widget, because the panel's Escape handler lives there too. */
+  drawerOpen: boolean
+  onDrawerOpenChange: (open: boolean) => void
 }) {
-  const { messages, status, error, send, stop, regenerate, editAndResend } = useChatStream({
-    transport,
-  })
+  const {
+    messages,
+    status,
+    error,
+    conversationId,
+    send,
+    stop,
+    regenerate,
+    editAndResend,
+    loadConversation,
+  } = useChatStream({ transport })
+
+  /**
+   * The drawer loads a stored transcript and hands it back whole; loading it is
+   * a replacement, never an append — the hook's `loadConversation` swaps the
+   * messages and adopts the id the transcript belongs to, so the next turn
+   * continues that conversation rather than forking a new one.
+   */
+  const openConversation = React.useCallback(
+    (loaded: { id: string; title: string | null; messages: TranscriptMessage[] }) => {
+      loadConversation(loaded.id, transcriptToUIMessages(loaded.messages))
+      onDrawerOpenChange(false)
+    },
+    [loadConversation, onDrawerOpenChange]
+  )
 
   const scrollRef = React.useRef<HTMLDivElement>(null)
 
@@ -399,6 +472,16 @@ function ChatSession({
       </div>
 
       <ChatInput onSend={send} onStop={stop} disabled={isStreaming} isStreaming={isStreaming} />
+
+      {/* A sibling of the scroll container and the composer, not a child of
+          either: the drawer is a portal over the panel, and nesting it in the
+          transcript would put it inside the region that scrolls. */}
+      <ConversationDrawer
+        open={drawerOpen}
+        onOpenChange={onDrawerOpenChange}
+        activeConversationId={conversationId}
+        onSelect={openConversation}
+      />
     </>
   )
 }

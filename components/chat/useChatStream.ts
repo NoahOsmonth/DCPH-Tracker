@@ -15,8 +15,9 @@
  * builds its parts from, so a part cannot be renamed on one side and silently
  * dropped on the other.
  *
- * The two mappings are exported pure functions so they can be tested without
- * React; the hook is the thin, stateful shell around them.
+ * The mappings and the stored-transcript converter are exported pure functions
+ * so they can be tested without React; the hook is the thin, stateful shell
+ * around them.
  */
 import * as React from "react"
 import { useChat } from "@ai-sdk/react"
@@ -243,6 +244,41 @@ export function toMessageViews(
   return messages.map((message) => toMessageView(message, context))
 }
 
+/**
+ * A stored transcript row, structurally. The drawer's `TranscriptMessage` and
+ * the route's `toMessagePayload` both satisfy this without either side importing
+ * the other — this module must not depend on a component.
+ *
+ * `role` is the SDK's own union rather than `user | assistant`: the stored rows
+ * carry `system` in their union too, and a narrower role here would refuse them
+ * at the call site while the server still owns those rows.
+ */
+export interface TranscriptMessageLike {
+  id: string
+  role: UIMessage["role"]
+  content: string
+}
+
+/**
+ * Stored transcript rows as the hook's message shape: text-only parts.
+ *
+ * A row is never dropped for empty content. These rows are the transcript the
+ * next request is built from (`toChatRequestBody`), so dropping one would
+ * silently rewrite the history the server is told about — and the server owns
+ * the transcript, not this converter. An empty row is a row.
+ *
+ * Only the text is carried: a stored row has no parts to restore, so a loaded
+ * turn renders as text alone rather than as a guess at the activity, evidence
+ * or citation parts the original stream may have had.
+ */
+export function transcriptToUIMessages(rows: readonly TranscriptMessageLike[]): UIMessage[] {
+  return rows.map((row) => ({
+    id: row.id,
+    role: row.role,
+    parts: [{ type: "text" as const, text: row.content }],
+  }))
+}
+
 /** The hook's status, which the SDK's `ChatStatus` cannot express (no `stopped`). */
 export type ChatStreamStatus = "idle" | "streaming" | "stopped" | "error"
 
@@ -268,6 +304,11 @@ export interface ChatStreamView {
   stop: () => void
   regenerate: (messageId?: string) => Promise<void>
   editAndResend: (messageId: string, text: string) => Promise<void>
+  /**
+   * Replace the transcript with a stored one and adopt its conversation id, so
+   * the next turn continues that conversation instead of starting a new one.
+   */
+  loadConversation: (id: string, messages: readonly UIMessage[]) => void
 }
 
 /**
@@ -320,6 +361,7 @@ export function useChatStream(options: UseChatStreamOptions = {}): ChatStreamVie
     sendMessage,
     regenerate: regenerateMessage,
     stop: stopStream,
+    setMessages,
   } = useChat<UIMessage>({ transport: transport ?? defaultTransport })
 
   const streamingMessageId =
@@ -374,6 +416,31 @@ export function useChatStream(options: UseChatStreamOptions = {}): ChatStreamVie
     [sendMessage]
   )
 
+  /**
+   * Replace the transcript with a stored one (the drawer hands back rows the
+   * server already owns).
+   *
+   * Three things happen in the same call, and each one matters:
+   *
+   * - the messages are replaced, never appended — the loaded transcript is the
+   *   whole conversation the server holds;
+   * - `stopped` is cleared. The flag is ours, not the SDK's, and it names the
+   *   last assistant turn; leaving it set would render the loaded conversation's
+   *   final answer as one the reader had stopped;
+   * - the id is written to the ref *and* to state. The transport reads the ref,
+   *   and a `setState` has not committed when a turn is sent from the same tick,
+   *   so state alone would post the next turn with the id from before the load.
+   */
+  const loadConversation = React.useCallback(
+    (id: string, messages: readonly UIMessage[]) => {
+      setStopped(false)
+      conversationIdRef.current = id
+      setConversationId(id)
+      setMessages([...messages])
+    },
+    [setMessages]
+  )
+
   return {
     messages,
     status,
@@ -383,6 +450,7 @@ export function useChatStream(options: UseChatStreamOptions = {}): ChatStreamVie
     stop,
     regenerate,
     editAndResend,
+    loadConversation,
   }
 }
 

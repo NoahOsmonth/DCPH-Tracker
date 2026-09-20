@@ -169,6 +169,52 @@ uncommitted work. Tasks 1–7 leave it alone; Tasks 8–11 may not begin until t
 committed, because "remaster the widget" and "preserve someone's uncommitted edits to the widget"
 cannot both be true of the same commit.
 
+### C1–C6 — corrections found while executing this plan
+
+Recorded as each task completed, in the Plan 4 pattern. A correction here overrides the task text
+above it.
+
+**C1 — The SDK's response helper is `createUIMessageStreamResponse`, not
+`toUIMessageStreamResponse`.** `ai@7.0.107` exports the former and not the latter; §4's diagram and
+D1 have been corrected in place (commit `3ebf538`). The server side is
+`createUIMessageStream({ execute })` → `createUIMessageStreamResponse({ stream, headers })`.
+
+**C2 — Task 2's file list is incomplete: `route.memory.test.ts` is a third route test.** It reads
+the streamed body as the answer, so the transport change breaks ten of its seventeen tests, while
+the task also requires the whole suite to pass. Adapted (test-only, mechanical, meaning-preserving)
+and committed with Task 2 as a sixth path. The in-flight workstream's ten files are untouched and
+still staged.
+
+**C3 — `PipelineResult.degraded` has eight values, not four.** Task 2's brief said "the four
+`PipelineResult` reasons"; the field can carry `pipeline_failed`, `corpus_unavailable`,
+`execute_budget`, `ladder_failed`, `tool_failed`, `retrieval_budget`, `evidence_evicted` and
+`corpus_static`. `lib/ai/stream/protocol.ts` exports all eight, plus the three route reasons and the
+three synthetic tokens — `DEGRADED_REASONS` is fourteen strings, and it is the vocabulary Task 6's
+wording table is checked against and Phase 6's queries filter on.
+
+**C4 — The stated part order cannot hold: `degraded` is sent up to twice.** `uncited` is a verdict
+on the finished answer and a synthetic token is a verdict on how the stream ended, so both are known
+only after the text. The order is `activity → evidence → [degraded] → text → [degraded] →
+[citations]`. Task 4 must merge reasons across **all** `data-degraded` parts rather than taking the
+first, and must not assume the part precedes the text it describes.
+
+**C5 — A synthetic state displaces `uncited` rather than joining it.** With evidence supplied and no
+answer, `validateCitations` reports `uncited: true` on the empty accumulator, so the naive union
+badged a rate-limited turn as an uncited one. `lateDegradedReasons` now returns the synthetic token
+alone when there is one (commit `1c9c630`); the log is unaffected, because its `outcome` column
+already names that state. Task 6's wording table needs no suppression rule of its own.
+
+**C6 — `readUIMessageStream` does not take the SSE response body.** It takes a
+`ReadableStream<UIMessageChunk>`; the bytes go through
+`parseJsonEventStream({ stream, schema: uiMessageChunkSchema })` first (all three exported from
+`ai`). The route tests' `readStream` helper does the full chain, and Tasks 4–7 should reuse that
+shape rather than re-derive it.
+
+**Verified at Task 2's close** (`c10f78f` + `1c9c630`): 77 files / 1,219 tests (node 76/1,218,
+dom 1/1); `tsc` exit 0; lint 0 errors / 14 pre-existing warnings; build succeeds with the three
+`/api/ai-chat*` route bundles emitted. `lib/ai/stream/protocol.ts` bundles for `platform=browser`
+with zero `import`/`require` statements, so Tasks 4–7 may import it from `components/**`.
+
 ## 6. Task index
 
 | # | Task | Files | Commit |

@@ -600,7 +600,14 @@ rolling summary last and only when nothing else remains. Memory and the system p
 evicted — the first is cheap and load-bearing, the second is the contract. Numbering is
 re-densified after eviction, so `[E1]` always exists while any evidence survives and no gap can
 be cited; `report.evicted` names the evicted ids, then the trimmed-turn count, then the summary,
-and any evicted document sets `degraded: "evidence_evicted"`. Each admitted document renders as
+and any evicted document sets `degraded: "evidence_evicted"`. Those two are not the same
+condition: the list is non-empty for a trimmed turn or a dropped summary too, while the reason is
+set only by a document or wiki id — so a non-empty `evicted` does not imply the badge. The list
+is carried out of the pipeline unchanged as `PipelineResult.evicted` (never null; `[]` when
+nothing was evicted) and onto the wire as an **optional** `ActivityPart.evicted`, omitted when
+empty, which is why `PROTOCOL_VERSION` stays `1`: an optional field is not a shape change. The
+activity trace words the three shapes on three separate lines rather than calling every entry a
+source. Each admitted document renders as
 one block — `[E#]`, its tag, its label (the document title, collapsed to one line), then the
 wrapped body — and `report.evidence` lists exactly the blocks that were rendered, so `[E2]`
 resolves to a real document id.

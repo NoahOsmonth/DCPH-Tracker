@@ -100,7 +100,7 @@ operator (browser)                          cron (Vercel)
                      ▼
         lib/ai/observability/store.ts          the read side, bounded
           summary({ sinceMs, untilMs })          counts by outcome / degraded_reason /
-          recent({ limit, cursor })              plan_source, latency, citation rate
+          recent({ limit })                      plan_source, latency, citation rate
           └─ createAdminClient()  ── SQL ──►  ai_request_log
         lib/ai/feedback/store.ts forMessages() ►  ai_message_feedback
 
@@ -192,10 +192,71 @@ should not expect two lines from it.
 `EVAL_K = 5`. Task 6 must document the gate with those real names and the real measured numbers
 (retrieval 0.9833, 59/60; pipeline 1.0000, 60/60).
 
-**Verified at Task 1's close** (`f9fbd7f` + `a968048`): 85 files / 1,348 tests (node 80 files /
-1,253 tests; dom 5 files / 95 tests); `tsc` exit 0; lint 0 errors / 14 warnings; build succeeds with
-the four `/api/ai-chat*` routes. `npm run test:eval` runs exactly the two eval files and prints
+**Verified at Task 1's close** (`f9fbd7f` + `a968048`): 85 files / **1,349** tests (node 80 files /
+**1,254** tests; dom 5 files / 95 tests); `tsc` exit 0; lint 0 errors / 14 warnings; build succeeds
+with the four `/api/ai-chat*` routes. `npm run test:eval` runs exactly the two eval files and prints
 `retrieval recall@5 0.9833 (59/60) ≥ 0.85` and `pipeline-level recall 1.0000 (60/60) ≥ 0.85`.
+The counts in this paragraph originally read 1,348 / 1,253 — C11 corrects them.
+
+### C6–C11 — corrections found while executing Task 2
+
+**C6 — §4's diagram promised a cursor that does not exist.** The diagram's operator row read
+`recent({ limit, cursor })`; §6 Task 2 item 3 and the module both implement `recent({ limit })` with
+no pagination. The diagram now says `recent({ limit })`. If the operator page ever needs a second
+page, that is new work with its own bound — a cursor over `created_at` is the obvious key, since
+`(created_at desc)` is already indexed.
+
+**C7 — §6 Task 2 item 2 is not implementable as a literal reading, and the plan must say what it
+actually gets.** PostgREST has no `GROUP BY`, so exact counts by `outcome`, `degraded_reason`,
+`plan_source` and `citations_valid` would require enumerating every value of a free `text` column.
+The module instead takes an **exact** `requestCount` from a `head: true` count (no rows
+transferred), and computes the buckets from a row sample capped at `PERCENTILE_SAMPLE_CAP`, exposing
+`sampled: boolean` and `sampledRows: number` so a capped breakdown can never be presented as the
+whole window. Task 3's page must render `sampled` — a breakdown shown without it is a lie about the
+window.
+
+**C8 — §6 Task 2 item 5 named four bounds but gave no values.** The module fixes them, and Task 3
+and Task 6 must import or quote these rather than restating them:
+
+| Constant | Value | Meaning |
+| --- | --- | --- |
+| `DEFAULT_WINDOW_MS` | `86_400_000` (24 h) | the window when a caller omits an edge |
+| `MAX_WINDOW_MS` | `2_592_000_000` (30 d) | the ceiling; the older edge moves, `untilMs` does not |
+| `RECENT_ROW_LIMIT` | `200` | `recent()`'s default **and** its ceiling |
+| `PERCENTILE_SAMPLE_CAP` | `1000` | rows a `summary` reads for buckets and latency |
+| `NULL_BUCKET` | `"none"` | the key a null reason or null source is counted under |
+
+`MAX_WINDOW_MS` is the one Task 3's route must import — a route that restates "30 days" as a literal
+is the second copy that drifts. `NULL_BUCKET` is a string because it is a `Record` key: a v1
+request's null `plan_source` and a request that degraded for no reason both land under `"none"`, and
+the page renders it as "none" rather than hiding it.
+
+**C9 — the latency trio omits `plan_ms`.** The table carries `plan_ms` and the writer sets it for v2
+requests, but §6 Task 2 item 2 asks only for `retrieve_ms` / `ttft_ms` / `total_ms`, so no percentile
+exists for planning. Each `recent` row does carry `planMs`. This is deliberate — `retrieve_ms`
+already contains planning (the Plan 5 C-finding that produced `ActivityTrace`'s "Retrieve (includes
+plan)" label) — but the plan should have said so instead of leaving a reader to wonder.
+
+**C10 — §6 Task 6 item 1 said "thirteen columns"; the table has nineteen.** Sixteen from
+`20260919090000` plus the three from `20260919130000` (`plan_source`, `tools`, `citations_valid`).
+Corrected in place above; the number would otherwise have propagated into `SYSTEM_DOCS.md` as fact.
+
+**C11 — this document's own Task 1 baseline was off by one test, and the cause is known.** Task 1's
+close recorded 1,348 / node 1,253. The true figures are **1,349 / node 1,254**. Proven, not guessed:
+a `git worktree` at `7e4f7dc` with `.env.local` copied in measures **84 files / 1,342 tests**, and
+the two files that worktree lacks relative to the working tree are
+`lib/__tests__/observability-store.test.ts` (Task 2's, 28 tests) and the **untracked**
+`lib/__tests__/characters-graph-engine.test.ts` (7 tests). 1,342 + 7 = 1,349. Nothing was added or
+removed between the two commits — `git diff --stat 7e4f7dc..HEAD` is the two new files alone — so
+the earlier number was a transcription error, not a drift. The lesson for the remaining tasks: when
+a count is recorded, the working tree contains untracked test files from the user's in-flight
+workstream, and any count that excludes them will disagree with a clean checkout.
+
+**Verified at Task 2's close** (`cd012fe`): 86 files / 1,377 tests (node 81 files / 1,282 tests; dom
+5 files / 95 tests); `tsc` exit 0; lint 0 errors / 14 warnings; build succeeds with the four
+`/api/ai-chat*` routes. The two new files are `lib/ai/observability/store.ts` (505 lines) and
+`lib/__tests__/observability-store.test.ts` (657 lines, 28 tests). The nine in-flight files remain
+staged and `components/chat/ChatWidget.tsx` is untouched.
 
 ## 6. Task index
 
@@ -365,7 +426,8 @@ store; `cron-auth`'s tests are pure.
 **Files:** `SYSTEM_DOCS.md`, `.env.example`
 
 1. A **"AI observability"** section in `SYSTEM_DOCS.md`: what `ai_request_log` carries (all
-   thirteen columns, with the three Phase 4 added), what the store's queries answer and their bounds,
+   nineteen columns — sixteen from `20260919090000`, plus the three Phase 4 added), what the store's
+   queries answer and their bounds (C8's five constants, quoted with their values),
    the operator surface and its two auth paths, the retention policy and its default age, the cron
    entries and their schedules, and the eval gate with the measured numbers and the gate value.
 2. `.env.example` gains `AI_LOG_RETENTION_DAYS` (default 90, meaning, and that an invalid value

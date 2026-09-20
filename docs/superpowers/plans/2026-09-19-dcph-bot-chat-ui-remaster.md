@@ -215,13 +215,45 @@ dom 1/1); `tsc` exit 0; lint 0 errors / 14 pre-existing warnings; build succeeds
 `/api/ai-chat*` route bundles emitted. `lib/ai/stream/protocol.ts` bundles for `platform=browser`
 with zero `import`/`require` statements, so Tasks 4–7 may import it from `components/**`.
 
+**C7 — Task 3's commit message was executed as `feat(ai): store per-message feedback`**, not §6's
+`feat(chat): record answer feedback`; the §6 line has been corrected to what history holds. Task 3's
+work is the store, the table and the route — none of it is chat UI — so the `ai` scope is the honest
+one, and Tasks 4–7 take the `chat` scope for the rendering work.
+
+**C8 — Task 3 item 3 undercounts the route's answers.** It lists 404/400/401; the route also needs
+the non-assistant **400** (you do not rate your own question, and the caller does own that message,
+so it is not a 404) and the missing-service-role **500** that every route in this repo answers with
+when `createAdminClient()` returns null. Both are implemented and tested. The plan's own constraint 6
+implies the 500 but item 3 never says so.
+
+**C9 — `lib/ai/feedback/store.ts` is one file where `lib/ai/memory` uses three.** Task 3's file list
+names a single file, so the port interface, the Supabase adapter and the policy layer all live in
+`store.ts`. No behavioural difference; noted because a reader looking for `feedback/port.ts` will
+not find one.
+
+**C10 — `forMessages(ids)` is deliberately not user-scoped.** Phase 6's reporting is a service-role
+read across users, so the port reads by message-id set only, and an empty set short-circuits in both
+the port and the store without a round trip. A per-user breakdown must join `user_id`, which every
+vote row carries.
+
+**C11 — `ai_messages.feedback` and `feedback_note` already exist and are dead.** They were added by
+`20260919110000_ai_memory.sql` and nothing reads or writes them; only
+`lib/__tests__/ai-memory-migration.test.ts` pins their presence. D3 chose a separate table for the
+reasons it gives, and the new migration's header records that the old columns are left in place,
+unread and unwritten, because migrations are additive only.
+
+**Verified at Task 3's close** (`498b74e`): 80 files / 1,251 tests (node 79/1,250, dom 1/1);
+`tsc` exit 0; lint 0 errors / 14 warnings; build succeeds with the four `/api/ai-chat*` route
+bundles emitted, including the new `feedback`. The migration is committed and **not applied**
+anywhere; no test executes SQL.
+
 ## 6. Task index
 
 | # | Task | Files | Commit |
 | --- | --- | --- | --- |
 | 1 | Dependencies, jsdom project, smoke test | `package.json`, `vitest.config.mts`, `vitest.setup.dom.ts`, `components/chat/__tests__/smoke.test.tsx` | `test(ui): add a jsdom project for component tests` |
 | 2 | The UI message stream and its parts | `lib/ai/stream/protocol.ts` + test, `app/api/ai-chat/route.ts`, route tests (additive) | `feat(ai): stream the answer as message parts` |
-| 3 | Feedback: table, store, route | migration, `lib/ai/feedback/store.ts` + test, `app/api/ai-chat/feedback/route.ts` + test, migration test | `feat(chat): record answer feedback` |
+| 3 | Feedback: table, store, route | migration, `lib/ai/feedback/store.ts` + test, `app/api/ai-chat/feedback/route.ts` + test, migration test | `feat(ai): store per-message feedback` |
 | 4 | The client transport and view model | `components/chat/useChatStream.ts` + test | `feat(chat): read the stream as parts` |
 | 5 | Citation chips and the sources panel | `CitationChips.tsx`, `SourcesPanel.tsx` + tests | `feat(chat): render citations against the evidence` |
 | 6 | Activity trace and degrade badges | `ActivityTrace.tsx` + test | `feat(chat): show what the pipeline did` |

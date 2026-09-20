@@ -11,11 +11,11 @@
  * Three rules shape the facade. It is *best effort*: `createRequestPersistence`
  * rejects when the store cannot resolve a conversation, and the caller decides
  * to fall back to the client's history — a conversation problem may never cost
- * an answer (constraint 14). It owns the `AI_MEMORY` switch, read once so a
- * request's read and write agree about which mode it is in (D6: unset or any
- * value other than "off" means on). And nothing it does after the response may
- * reject: `after()` has no error boundary of its own, so `afterTurn` contains
- * every failure as a `[ai-chat]` line and a resolved promise.
+ * an answer (constraint 14). It reads the `AI_MEMORY` switch once per request,
+ * so a request's read and write agree about which mode it is in (D6: unset or
+ * any value other than "off" means on). And nothing it does after the response
+ * may reject: `after()` has no error boundary of its own, so `afterTurn`
+ * contains every failure as a `[ai-chat]` line and a resolved promise.
  *
  * No I/O of its own beyond what the injected clock and the adapters do, so a
  * test drives every branch with a scripted admin client and never constructs a
@@ -35,6 +35,7 @@ import {
   createSupabaseMemoryPort,
   type MemoryClient,
 } from "@/lib/ai/memory/supabase-port"
+import { MEMORY_OFF, isMemoryEnabled } from "@/lib/ai/memory/flag"
 import { createMemoryStore } from "@/lib/ai/memory/store"
 import { renderMemoryAnswer } from "@/lib/ai/memory/recall"
 import { renderMemoryBlock, selectMemories } from "@/lib/ai/memory/score"
@@ -42,18 +43,12 @@ import { createMemoryWriter, type MemoryWriter } from "@/lib/ai/memory/write"
 import { toStructuredCall } from "@/lib/ai/structured-call"
 import { buildProviderTargets } from "@/lib/ai/targets"
 
-/** The one value that means "memory is off" (D6). */
-export const MEMORY_OFF = "off"
-
 /**
- * D6's second kill switch: transcripts keep working, every memory read and the
- * memory write stop. Absence is not off — an unset variable is the normal
- * production state, and a kill switch that has to be written down is one that
- * gets forgotten.
+ * Re-exported so the switch keeps living on this module's public surface: the
+ * definitions moved to `lib/ai/memory/flag.ts` so the transparency route can
+ * read them without this seam's provider graph.
  */
-export function isMemoryEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return env.AI_MEMORY !== MEMORY_OFF
-}
+export { MEMORY_OFF, isMemoryEnabled }
 
 /** A turn as the route's prompt wants it: no ids, no timestamps, no system role. */
 export interface PersistedTurn {

@@ -18,6 +18,7 @@ import { NextResponse } from "next/server"
 
 import { createClient } from "@/utils/supabase/server"
 import { createAdminClient } from "@/utils/supabase/admin"
+import { isMemoryEnabled } from "@/lib/ai/memory/flag"
 import type { MemoryFact } from "@/lib/ai/memory/port"
 import { MEMORY_LIST_LIMIT, createMemoryStore, type MemoryStore } from "@/lib/ai/memory/store"
 import { createSupabaseMemoryPort, type MemoryClient } from "@/lib/ai/memory/supabase-port"
@@ -99,8 +100,12 @@ export async function GET() {
     // The store's order is the page's order (active first, then newest-confirmed)
     // and its default limit is the cap reported to the client.
     const facts = await store.list(auth.userId)
+    // `memoryEnabled` reports the switch, it does not consult it: D6 stops
+    // extraction and injection, not transparency, so the facts are returned
+    // either way. It exists so the page can tell "memory is off" from "nothing
+    // stored yet" -- both of which arrive as an empty `facts` array.
     return NextResponse.json(
-      { facts: facts.map(toPayload), cap: MEMORY_LIST_LIMIT },
+      { facts: facts.map(toPayload), cap: MEMORY_LIST_LIMIT, memoryEnabled: isMemoryEnabled() },
       { headers: { "Cache-Control": "no-store" } }
     )
   } catch (error) {

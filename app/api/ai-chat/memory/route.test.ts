@@ -188,11 +188,13 @@ describe("GET /api/ai-chat/memory", () => {
     const body = (await response.json()) as {
       facts: Record<string, unknown>[]
       cap: number
+      memoryEnabled: boolean
     }
 
     expect(response.status).toBe(200)
     expect(response.headers.get("Cache-Control")).toBe("no-store")
     expect(body.cap).toBe(50)
+    expect(body.memoryEnabled).toBe(true)
     expect(body.facts.map((fact) => fact.status)).toEqual(["active", "superseded"])
     // The exact payload: nothing about the row that is not the user's business,
     // and no user id at all.
@@ -220,6 +222,25 @@ describe("GET /api/ai-chat/memory", () => {
 
     expect(response.status).toBe(200)
     expect(admin.calls.length).toBeGreaterThan(0)
+  })
+
+  it("reports memoryEnabled false and still lists the stored facts when AI_MEMORY is off", async () => {
+    // The two facts together are the point: the flag lets the page tell "memory
+    // is off" from "nothing stored yet", while the facts are still returned --
+    // D6 stops extraction and injection, not transparency.
+    process.env.AI_MEMORY = "off"
+    createAdminClient.mockReturnValue(createFakeAdmin({ rows: [factRow()] }))
+    const { GET } = await import("@/app/api/ai-chat/memory/route")
+
+    const response = await GET()
+    const body = (await response.json()) as {
+      facts: Record<string, unknown>[]
+      memoryEnabled: boolean
+    }
+
+    expect(response.status).toBe(200)
+    expect(body.memoryEnabled).toBe(false)
+    expect(body.facts.map((fact) => fact.id)).toEqual([FACT_ID])
   })
 
   it("answers 500 with the database's message when the read fails", async () => {

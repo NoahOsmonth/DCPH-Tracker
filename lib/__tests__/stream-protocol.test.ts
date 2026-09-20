@@ -247,6 +247,21 @@ describe("the eviction vocabulary", () => {
     expect(TURN_EVICTION_MARKER).toBe(TURN_EVICTION_PREFIX)
     expect(SUMMARY_EVICTION_MARKER).toBe(SUMMARY_EVICTION)
   })
+
+  it("keeps this module browser-bundle-safe: every import is a type import", async () => {
+    // The duplication above exists only because this rule holds. A single value
+    // import from the pipeline would pull the assembler, its tokenizer and the
+    // whole retrieval stack into every client bundle that renders a trace, and
+    // nothing else in the suite would notice. Reading the source is the check:
+    // a bundle step would only catch it after the fact, and only for the one
+    // entry point it happened to bundle.
+    const { readFile } = await import("node:fs/promises")
+    const source = await readFile("lib/ai/stream/protocol.ts", "utf8")
+    const imports = source.match(/^\s*import\s.+$/gm) ?? []
+
+    expect(imports.length).toBeGreaterThan(0)
+    expect(imports.filter((line) => !/^\s*import\s+type\s/.test(line))).toEqual([])
+  })
 })
 
 /* ------------------------------------------------------------------ */

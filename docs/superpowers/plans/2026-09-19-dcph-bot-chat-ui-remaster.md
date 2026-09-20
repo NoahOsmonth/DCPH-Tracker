@@ -247,6 +247,36 @@ unread and unwritten, because migrations are additive only.
 bundles emitted, including the new `feedback`. The migration is committed and **not applied**
 anywhere; no test executes SQL.
 
+**C12 — Task 4's signature has no transport test seam.** The task's own Rule says a test drives the
+hook with a scripted stream, but `useChatStream({ conversationId })` gives a test nowhere to put
+one. The hook takes an optional `transport?: ChatTransport<UIMessage>`, documented as a test seam;
+production callers still pass only `conversationId`.
+
+**C13 — Task 4 item 4 is not implementable as written.** `ai@7.0.107`'s `ChatInit` has no response
+or fetch callback, so `X-Conversation-Id` can only be read by wrapping `DefaultChatTransport`'s
+`fetch` option. The wrapper returns the response unchanged so the transport still parses the SSE
+body. The hook also holds no top-level `api` option to pass: in this version the URL lives on the
+transport.
+
+**C14 — Task 4 item 3's five endings are not disjoint.** Every synthetic token is also a member of
+`DEGRADED_REASONS`, so "ended in a synthetic string" and "ended with a degrade" overlap by
+construction. `MessageState` is a precedence — streaming > stopped > synthetic > degraded >
+complete — not a partition, and `degraded` still carries every merged reason so a renderer may badge
+from it directly.
+
+**C15 — Task 4 item 1's field list omits `id` and `role`.** Without `id`, Task 8 cannot call
+`editAndResend`; without `role`, Task 7 cannot render a turn. Both are on `ChatMessageView`.
+
+**C16 — Task 4 does not define the absent-`activity` case.** The protocol version travels only in
+the activity part, so its absence is ambiguous. The rule: an activity part carrying a version the
+client does not know means the whole turn renders as text alone; **no** activity part at all is not
+a version claim, so shape-valid data parts are accepted (the `protocol.ts` guards remain the safety
+net). This keeps a hand-built or partial stream testable without inventing a version.
+
+**Verified at Task 4's close** (`7d95757`): 81 files / 1,276 tests (node 79/1,250, dom 2/26);
+`tsc` exit 0; lint 0 errors / 14 warnings; build succeeds with the four `/api/ai-chat*` bundles, and
+`/community/chat`'s first load is unchanged at 110 kB because nothing imports the hook yet.
+
 ## 6. Task index
 
 | # | Task | Files | Commit |

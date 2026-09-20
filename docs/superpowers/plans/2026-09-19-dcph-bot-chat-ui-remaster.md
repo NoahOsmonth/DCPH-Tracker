@@ -404,6 +404,62 @@ treats a missing field as unknown and makes no claim, so it stays honest against
 | 11 | Accessibility, keyboard and mobile | the chat components + tests (**P1**) | `feat(chat): keyboard and screen-reader paths` |
 | 12 | Documentation and phase verification | `SYSTEM_DOCS.md`, `.env.example` | `docs(chat): document the remastered surface` |
 
+**Execution status.** Every task whose work lies outside the frozen `ChatWidget.tsx` has shipped, and each
+was verified independently before its commit (scope check, the diff read, `npx tsc --noEmit`, the full
+suite). Tasks 8–12 as written each bundle one frozen-file requirement, which C31 and C32 name.
+
+| Task | Shipped | Commit |
+| --- | --- | --- |
+| 8 | Escape stops a streaming answer in `ChatInput.tsx` | `6a3ba04` |
+| 9 | `ConversationDrawer.tsx` + 14 tests | `c86781b` |
+| 10 | `memoryEnabled` on `GET /api/ai-chat/memory` + test | `5712989` |
+| 10 | `MemoryPanel.tsx` + 14 tests | `9ae7606` |
+| 11 | `a11y.test.tsx` + 13 tests, and the focus-restore fix it found | `bf6c5ea` |
+| 11 | `responsive.test.tsx` + 11 tests, sheet sizing and touch targets | `4ec7126` |
+| 12 | The Chat UI section and `.env.example` | `eb9a489` |
+
+Outstanding, all inside `ChatWidget.tsx` and all waiting on P1: the widget rebuilt on `useChatStream`, its
+wiring of the drawer and the panel, the message container's live-region transition (C31), the regenerate
+keyboard path and the composer's viewport placement (C32). Nothing renders the drawer or the panel yet —
+they exist, they are tested, they are prop-driven, and the file that would open them is frozen.
+
+Two product defects were found by writing the tests, not by reading the code, and both are fixed:
+Radix restores focus only to a `DialogTrigger`, so closing any of these panels left focus on `<body>`
+(`bf6c5ea`); and the `DialogContent` centring pair `top-[50%]` / `translate-y-[-50%]` does not cancel for
+a full-height element, because `top` resolves against the containing block while `translateY` resolves
+against the element's own height — a sheet relying on the coincidence would sit off the top edge
+(`4ec7126`).
+
+**C31 — Task 11 item 1's live region is inside the frozen file, so item 1 is gated.** The message
+container's `aria-live="polite"` / `aria-atomic="false"` lives in `components/chat/ChatWidget.tsx`
+(around line 331), not in `ChatMessage.tsx`, and no component the task's file list names as editable
+carries it. It also does not switch to `off` or `role="log"` when a turn completes. The attribute
+transition is therefore part of the pending widget rebuild. Recorded so it is not mistaken for shipped
+work: the a11y tests assert the keyboard, focus and reduced-motion properties that *do* ship, and say
+nothing about the live region.
+
+**C32 — Task 11 items 2 and 5 each carry one requirement that is also inside the frozen file.** Item 2's
+keyboard list includes "regenerate", which is a widget control; item 5's "the composer stays above the
+keyboard" is the panel's `fixed bottom-5 right-5` placement, also the widget's. `responsive.test.tsx`
+asserts only what the editable components own — that `ChatInput`'s form carries no `fixed`, `absolute` or
+`sticky` token, so the composer does not position itself — and labels that as the ownership boundary
+rather than as evidence that the composer clears a soft keyboard. The claim is deliberately not made.
+
+**C33 — Task 12's brief filed the null-versus-empty wordings under the wrong surface.** `none` and
+`not recorded` are `formatTools` and `unmeasured` is `formatCitations`, both in
+`components/admin/AiObservabilityReport.tsx`. The chat view model has no such wording: `ActivityTrace`'s
+`activitySummary` renders "no steps" for an empty tool list, and `ChatMessage` renders no tools line at
+all. C37 already attributed these to Observability (Plan 6 T3) correctly; the error was in the Task 12
+dispatch brief, and the documentation states the real location rather than repeating it. This is the
+second time a claim about these wordings has drifted toward the chat surface, which is why the Chat UI
+section now names the admin file explicitly.
+
+**C34 — "`toUIMessageStreamResponse` does not exist" is too strong, and the precise version matters.**
+It exists as a deprecated method on a `streamText` result; it is absent from `ai`'s standalone exports,
+which is the fact that matters here — `createUIMessageStreamResponse` is the standalone export
+`app/api/ai-chat/route.ts` uses. The documentation carries the precise form, so a reader looking for the
+name is not told it is nowhere.
+
 ---
 
 ### Task 1 — Dependencies, jsdom project, smoke test

@@ -240,6 +240,31 @@ async function sendText(user: User, text: string): Promise<void> {
   await user.click(screen.getByRole("button", { name: "Send message" }))
 }
 
+/**
+ * Tabs forward until `target` holds focus, so a test asserts that a control is
+ * keyboard-reachable rather than a fixed tab count. The same helper as
+ * `a11y.test.tsx`: the counts differ between the inline and modal shapes, and
+ * Radix's trap owns the order inside a dialog.
+ */
+async function tabTo(user: User, target: HTMLElement, limit = 12): Promise<void> {
+  for (let i = 0; i < limit && document.activeElement !== target; i += 1) {
+    await user.tab()
+  }
+  expect(target).toHaveFocus()
+}
+
+/**
+ * Open the panel with the keyboard alone. Every test in the keyboard-only block
+ * starts here: a launcher that only opens under a pointer would be the failure
+ * the block exists to catch.
+ */
+async function openPanelWithKeyboard(user: User): Promise<void> {
+  const launcher = screen.getByRole("button", { name: "Open DCPH Bot" })
+  await tabTo(user, launcher)
+  await user.keyboard("{Enter}")
+  await screen.findByRole("dialog", { name: "DCPH Bot — episode finder" })
+}
+
 beforeEach(() => {
   mocks.user = { id: "user-1" }
   mocks.openAuthModal.mockClear()
@@ -284,11 +309,55 @@ describe("the launcher and the panel", () => {
     expect(tokens.has("bottom-5")).toBe(true)
     expect(tokens.has("right-5")).toBe(true)
     expect(tokens.has("w-[min(26rem,calc(100vw-1.5rem))]")).toBe(true)
-    expect(tokens.has("h-[min(34rem,calc(100vh-6rem))]")).toBe(true)
+    // `dvh` is the dynamic viewport height, so the height tracks the visible
+    // area when the on-screen keyboard shrinks it; the old `vh` unit did not.
+    expect(tokens.has("h-[min(34rem,calc(100dvh-6rem))]")).toBe(true)
 
     // `mounted` flips on the next frame, which is the enter transition.
     await waitFor(() => expect(dialog.className).toContain("translate-y-0"))
     expect(dialog.className).toContain("opacity-100")
+  })
+
+  it("anchors the panel to the visible bottom with a dynamic-viewport height", async () => {
+    const user = userEvent.setup()
+    render(<ChatWidget />)
+    await user.click(screen.getByRole("button", { name: "Open DCPH Bot" }))
+
+    const dialog = await screen.findByRole("dialog", { name: "DCPH Bot — episode finder" })
+    const tokens = new Set(dialog.className.split(/\s+/).filter(Boolean))
+
+    // `bottom-5` is the anchor: the panel is fixed to the bottom edge, so when
+    // the on-screen keyboard shrinks the viewport the composer stays at the
+    // bottom of the visible area.
+    expect(tokens.has("bottom-5")).toBe(true)
+    // The height is a dynamic viewport unit, not `vh`, so it tracks the visible
+    // area on its own rather than relying solely on `interactiveWidget:
+    // "resizes-content"` in app/layout.tsx, which a browser may ignore.
+    expect([...tokens].some((token) => token.includes("100dvh"))).toBe(true)
+    expect([...tokens].some((token) => token.includes("100vh"))).toBe(false)
+  })
+
+  it("keeps the drawer and the memory panel as full-height sheets", async () => {
+    stubRoutes()
+    const user = await renderWidget(scriptedTransport(() => completeTurnChunks("x")).transport)
+
+    await openDrawer(user)
+    const drawer = screen.getByRole("dialog", { name: "Conversations" })
+    // `h-dvh` makes the sheet the dynamic viewport and `top-0`/`translate-y-0`
+    // pins it; the centring pair returns at `sm`. The full sheet contract,
+    // including the modal sources panel, is pinned in responsive.test.tsx.
+    expect(drawer.className).toContain("h-dvh")
+    expect(drawer.className).toContain("top-0")
+
+    await user.keyboard("{Escape}")
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "Conversations" })).not.toBeInTheDocument()
+    )
+
+    await user.click(screen.getByRole("button", { name: "What the bot remembers" }))
+    const memory = await screen.findByRole("dialog", { name: "What the bot remembers" })
+    expect(memory.className).toContain("h-dvh")
+    expect(memory.className).toContain("top-0")
   })
 })
 
@@ -396,6 +465,41 @@ describe("sending a turn", () => {
     await sendText(user, "hi")
 
     expect(await screen.findByText("not signed in")).toBeInTheDocument()
+  })
+})
+
+describe("the live region", () => {
+  it("is polite while streaming and goes quiet once the turn settles", async () => {
+    const { transport, push } = controllableTransport()
+    const user = await renderWidget(transport)
+
+    // Idle: a settled transcript is a log, and its announcements are off, so a
+    // screen reader does not re-read the whole conversation on every change.
+    const region = screen.getByRole("log")
+    expect(region).toHaveAttribute("aria-live", "off")
+    expect(region).toHaveAttribute("aria-atomic", "false")
+
+    await sendText(user, "Who is Bourbon?")
+    await screen.findByLabelText("DCPH Bot is typing")
+
+    // Streaming: polite, so the answer is announced as it arrives. The log role
+    // belongs to the settled state, so it is not present mid-turn.
+    expect(region).toHaveAttribute("aria-live", "polite")
+    expect(region).not.toHaveAttribute("role")
+
+    await act(async () => {
+      push({ type: "text-start", id: "answer" })
+      push({ type: "text-delta", id: "answer", delta: "Bourbon is" })
+    })
+    expect(screen.getByText("Bourbon is")).toBeInTheDocument()
+    expect(region).toHaveAttribute("aria-live", "polite")
+
+    // Stopping settles the turn; the same node must go quiet, not stay polite.
+    await user.click(screen.getByRole("button", { name: "Stop generating" }))
+
+    await waitFor(() => expect(region).toHaveAttribute("aria-live", "off"))
+    expect(region).toHaveAttribute("role", "log")
+    expect(region).toHaveAttribute("aria-atomic", "false")
   })
 })
 
@@ -707,5 +811,229 @@ describe("the memory panel", () => {
     await user.click(screen.getByRole("button", { name: "Open DCPH Bot" }))
     await screen.findByRole("dialog", { name: "DCPH Bot — episode finder" })
     expect(screen.queryByRole("dialog", { name: MEMORY_CONTROL })).not.toBeInTheDocument()
+  })
+})
+
+/**
+ * The widget driven by the keyboard alone. No test in this block calls
+ * `.click()`: a control that only works under a pointer is the failure the block
+ * exists to catch. The pointer paths keep their own coverage above.
+ */
+describe("the keyboard path", () => {
+  it("sends a turn with Enter in the composer", async () => {
+    const { transport, calls } = scriptedTransport(() => completeTurnChunks("Bourbon is Rei Furuya."))
+    const user = userEvent.setup()
+    render(<ChatWidget transport={transport} />)
+    await openPanelWithKeyboard(user)
+
+    const box = screen.getByRole("textbox", { name: /ask about detective conan episodes/i })
+    await tabTo(user, box)
+    await user.keyboard("Who is Bourbon?{Enter}")
+
+    expect(await screen.findByText("Bourbon is Rei Furuya.")).toBeInTheDocument()
+    expect(calls).toHaveLength(1)
+    expect(JSON.stringify(calls[0].messages)).toContain("Who is Bourbon?")
+  })
+
+  it("stops a streaming turn with Escape", async () => {
+    const { transport, push } = controllableTransport()
+    const user = userEvent.setup()
+    render(<ChatWidget transport={transport} />)
+    await openPanelWithKeyboard(user)
+
+    const box = screen.getByRole("textbox", { name: /ask about detective conan episodes/i })
+    await tabTo(user, box)
+    await user.keyboard("Who is Bourbon?{Enter}")
+    await screen.findByLabelText("DCPH Bot is typing")
+
+    await act(async () => {
+      push({ type: "text-start", id: "answer" })
+      push({ type: "text-delta", id: "answer", delta: "Bourbon is" })
+    })
+    await screen.findByText("Bourbon is")
+
+    await user.keyboard("{Escape}")
+
+    expect(await screen.findByText("Stopped — this answer may be incomplete.")).toBeInTheDocument()
+    // Stopping is not closing: the panel stays, and focus is still in the
+    // composer, so the reader can type the next turn without a pointer.
+    expect(screen.getByRole("dialog", { name: "DCPH Bot — episode finder" })).toBeInTheDocument()
+    expect(document.activeElement).toBe(box)
+  })
+
+  it("reaches and fires Regenerate", async () => {
+    const { transport, calls } = scriptedTransport((_call, index) => [
+      { type: "text-start", id: "answer" },
+      { type: "text-delta", id: "answer", delta: index === 0 ? "first answer" : "second answer" },
+      { type: "text-end", id: "answer" },
+    ])
+    const user = userEvent.setup()
+    render(<ChatWidget transport={transport} />)
+    await openPanelWithKeyboard(user)
+
+    const box = screen.getByRole("textbox", { name: /ask about detective conan episodes/i })
+    await tabTo(user, box)
+    await user.keyboard("Who is Bourbon?{Enter}")
+    await screen.findByText("first answer")
+
+    // The regenerate control sits in the transcript, behind the composer in tab
+    // order, so the tab wraps around the panel to reach it.
+    const regenerate = screen.getByRole("button", { name: "Regenerate answer" })
+    await tabTo(user, regenerate, 20)
+    await user.keyboard("{Enter}")
+
+    expect(await screen.findByText("second answer")).toBeInTheDocument()
+    expect(calls).toHaveLength(2)
+    expect(calls[1].trigger).toBe("regenerate-message")
+  })
+
+  it("fires a suggestion chip", async () => {
+    const { transport, calls } = scriptedTransport(() => completeTurnChunks("ok"))
+    const user = userEvent.setup()
+    render(<ChatWidget transport={transport} />)
+    await openPanelWithKeyboard(user)
+
+    const chip = screen.getByRole("button", { name: /What should I watch next/ })
+    await tabTo(user, chip)
+    await user.keyboard("{Enter}")
+
+    await waitFor(() => expect(calls).toHaveLength(1))
+    expect(JSON.stringify(calls[0].messages)).toContain(
+      "What should I watch next based on my tracker progress?"
+    )
+  })
+
+  it("opens and closes the conversation drawer", async () => {
+    stubRoutes()
+    const user = userEvent.setup()
+    render(<ChatWidget transport={scriptedTransport(() => completeTurnChunks("x")).transport} />)
+    await openPanelWithKeyboard(user)
+
+    const control = screen.getByRole("button", { name: "Your conversations" })
+    await tabTo(user, control)
+    await user.keyboard("{Enter}")
+    await screen.findByRole("dialog", { name: "Conversations" })
+    await screen.findByRole("button", { name: /^Bourbon trivia/ })
+
+    await user.keyboard("{Escape}")
+
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "Conversations" })).not.toBeInTheDocument()
+    )
+    expect(screen.getByRole("dialog", { name: "DCPH Bot — episode finder" })).toBeInTheDocument()
+  })
+
+  it("opens the memory panel, deletes a fact and closes it", async () => {
+    const fetchMock = stubRoutes()
+    const user = userEvent.setup()
+    render(<ChatWidget transport={scriptedTransport(() => completeTurnChunks("x")).transport} />)
+    await openPanelWithKeyboard(user)
+
+    const control = screen.getByRole("button", { name: "What the bot remembers" })
+    await tabTo(user, control)
+    await user.keyboard("{Enter}")
+    await screen.findByRole("dialog", { name: "What the bot remembers" })
+    await screen.findByText("favorite_character")
+
+    const remove = screen.getByRole("button", { name: "Delete favorite_character" })
+    await tabTo(user, remove, 8)
+    await user.keyboard("{Enter}")
+    expect(screen.getByText("Delete this fact?")).toBeInTheDocument()
+
+    const confirm = screen.getByRole("button", { name: "Delete" })
+    await tabTo(user, confirm, 4)
+    await user.keyboard("{Enter}")
+
+    await waitFor(() => expect(screen.queryByText("favorite_character")).not.toBeInTheDocument())
+    const deletes = fetchMock.mock.calls.filter(
+      (call) => (call[1] as RequestInit | undefined)?.method === "DELETE"
+    )
+    expect(deletes.map((call) => String(call[0]))).toEqual([
+      `/api/ai-chat/memory?id=${MEMORY_FACT.id}`,
+    ])
+
+    await user.keyboard("{Escape}")
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", { name: "What the bot remembers" })
+      ).not.toBeInTheDocument()
+    )
+    expect(screen.getByRole("dialog", { name: "DCPH Bot — episode finder" })).toBeInTheDocument()
+  })
+})
+
+/**
+ * Focus management through its observable contract — where
+ * `document.activeElement` is — never through Radix's internals.
+ */
+describe("focus management", () => {
+  it("moves focus into the drawer and returns it to the header control that opened it", async () => {
+    stubRoutes()
+    const user = userEvent.setup()
+    render(<ChatWidget transport={scriptedTransport(() => completeTurnChunks("x")).transport} />)
+    await openPanelWithKeyboard(user)
+
+    const control = screen.getByRole("button", { name: "Your conversations" })
+    await tabTo(user, control)
+    await user.keyboard("{Enter}")
+
+    const drawer = await screen.findByRole("dialog", { name: "Conversations" })
+    await waitFor(() => expect(drawer).toContainElement(document.activeElement as HTMLElement))
+    expect(document.activeElement).not.toBe(control)
+
+    await user.keyboard("{Escape}")
+
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "Conversations" })).not.toBeInTheDocument()
+    )
+    await waitFor(() => expect(document.activeElement).toBe(control))
+  })
+
+  it("moves focus into the memory panel and returns it to the header control that opened it", async () => {
+    stubRoutes()
+    const user = userEvent.setup()
+    render(<ChatWidget transport={scriptedTransport(() => completeTurnChunks("x")).transport} />)
+    await openPanelWithKeyboard(user)
+
+    const control = screen.getByRole("button", { name: "What the bot remembers" })
+    await tabTo(user, control)
+    await user.keyboard("{Enter}")
+
+    const panel = await screen.findByRole("dialog", { name: "What the bot remembers" })
+    await waitFor(() => expect(panel).toContainElement(document.activeElement as HTMLElement))
+    expect(document.activeElement).not.toBe(control)
+
+    await user.keyboard("{Escape}")
+
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", { name: "What the bot remembers" })
+      ).not.toBeInTheDocument()
+    )
+    await waitFor(() => expect(document.activeElement).toBe(control))
+  })
+
+  it("keeps focus in the composer while the placeholder and the answer render", async () => {
+    const { transport, push } = controllableTransport()
+    const user = userEvent.setup()
+    render(<ChatWidget transport={transport} />)
+    await openPanelWithKeyboard(user)
+
+    const box = screen.getByRole("textbox", { name: /ask about detective conan episodes/i })
+    await tabTo(user, box)
+    await user.keyboard("Who is Bourbon?{Enter}")
+
+    // The typing-dots stand-in must not pull focus out of the composer.
+    expect(await screen.findByLabelText("DCPH Bot is typing")).toBeInTheDocument()
+    expect(document.activeElement).toBe(box)
+
+    await act(async () => {
+      push({ type: "text-start", id: "answer" })
+      push({ type: "text-delta", id: "answer", delta: "Bourbon is Rei Furuya." })
+    })
+
+    // Nor does the real streaming message that replaces it.
+    expect(screen.getByText("Bourbon is Rei Furuya.")).toBeInTheDocument()
+    expect(document.activeElement).toBe(box)
   })
 })

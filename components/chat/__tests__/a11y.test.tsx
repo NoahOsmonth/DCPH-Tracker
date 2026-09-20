@@ -444,6 +444,11 @@ describe("reduced motion", () => {
     expect(screen.getByRole("list", { name: "Sources cited" }).style.opacity).toBe("1")
     expect(screen.getByRole("complementary").style.opacity).toBe("1")
     expect(panel?.style.opacity).toBe("1")
+
+    // The chevron's CSS transform transition is the trace's other
+    // reduced-motion branch: with the preference set it carries no
+    // `transition-transform`.
+    expect(toggle.querySelector("svg")).not.toHaveClass("transition-transform")
   })
 
   it("applies the animated initial state when reduced motion is off", async () => {
@@ -454,6 +459,7 @@ describe("reduced motion", () => {
       <>
         <CitationChips refs={REFS} citations={REPORT} />
         <SourcesPanel refs={REFS} citations={REPORT} open onOpenChange={() => {}} />
+        <ActivityTrace activity={ACTIVITY} />
       </>
     )
 
@@ -461,5 +467,12 @@ describe("reduced motion", () => {
     // applied, so the two branches cannot collapse into one unnoticed.
     expect(screen.getByRole("list", { name: "Sources cited" }).style.opacity).toBe("0")
     expect(screen.getByRole("complementary").style.opacity).toBe("0")
+
+    // The trace's expansion is the third `motion.*` transition in the chat
+    // surface. Its framer `initial` is asserted in the reduced-on test above;
+    // here its chevron's CSS transition is the branch that can be read off the
+    // rendered class list without racing the animation.
+    const toggle = screen.getByRole("button", { name: /Show details/ })
+    expect(toggle.querySelector("svg")).toHaveClass("transition-transform")
   })
 })

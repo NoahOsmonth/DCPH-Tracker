@@ -255,7 +255,7 @@ export function ConversationDrawer({
             )}
 
             {conversations !== null && conversations.length > 0 && (
-              <ul aria-label="Conversations" className="max-h-[60vh] space-y-2 overflow-y-auto">
+              <ul aria-label="Conversations" className="max-h-[60dvh] space-y-2 overflow-y-auto">
                 {conversations.map((conversation) => {
                   const current = conversation.id === activeConversationId
                   const pending = conversation.id === pendingSelectId

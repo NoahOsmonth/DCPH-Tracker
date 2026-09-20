@@ -257,7 +257,7 @@ export function MemoryPanel({ open, onOpenChange, className }: MemoryPanelProps)
             )}
 
             {facts !== null && facts.length > 0 && (
-              <ul aria-label="Remembered facts" className="max-h-[60vh] space-y-2 overflow-y-auto">
+              <ul aria-label="Remembered facts" className="max-h-[60dvh] space-y-2 overflow-y-auto">
                 {facts.map((fact) => {
                   const active = fact.status === "active"
                   const confirming = fact.id === confirmingId

@@ -244,7 +244,12 @@ export function ChatWidget({ transport }: ChatWidgetProps = {}) {
           className={cn(
             "fixed bottom-5 right-5 z-50 flex flex-col overflow-hidden rounded-2xl",
             "border border-line bg-surface shadow-2xl shadow-black/70",
-            "w-[min(26rem,calc(100vw-1.5rem))] h-[min(34rem,calc(100vh-6rem))]",
+            // `dvh` is the dynamic viewport height, so the panel's height tracks
+            // the visible area when the on-screen keyboard shrinks it — the same
+            // job `interactiveWidget: "resizes-content"` does in app/layout.tsx,
+            // but not dependent on a browser honouring the meta tag. `bottom-5`
+            // keeps the composer's edge anchored to the visible bottom.
+            "w-[min(26rem,calc(100vw-1.5rem))] h-[min(34rem,calc(100dvh-6rem))]",
             "transition-all duration-200 ease-out",
             mounted ? "translate-y-0 opacity-100" : "translate-y-4 opacity-0",
             chromeHidden && "hidden"
@@ -441,7 +446,13 @@ function ChatSession({
       <div
         ref={scrollRef}
         className="flex-1 space-y-3 overflow-y-auto px-4 py-4"
-        aria-live="polite"
+        // The live-region contract: while a turn is streaming the container is
+        // `polite`, so the answer is announced as it arrives; once the turn
+        // settles it is a `log` with announcements off, so a screen reader does
+        // not re-read the whole transcript token by token. `aria-atomic="false"`
+        // keeps an announcement to the changed node rather than the whole list.
+        aria-live={isStreaming ? "polite" : "off"}
+        role={isStreaming ? undefined : "log"}
         aria-atomic="false"
       >
         <Greeting />

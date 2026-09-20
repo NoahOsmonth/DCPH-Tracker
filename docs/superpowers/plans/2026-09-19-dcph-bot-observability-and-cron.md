@@ -450,6 +450,79 @@ succeeds with `/api/admin/ai-retention` (258 B) and `/api/sync` (258 B) in the r
 in exactly one place (`lib/cron-auth.ts`) with four importing routes. The nine in-flight files remain
 staged and `components/chat/ChatWidget.tsx` is untouched.
 
+### C32–C35 — corrections found while executing Task 6
+
+**C32 — §6 Task 6 item 3's test list was incomplete.** The item says "no test executes SQL —
+`lib/__tests__/ai-request-log-migration.test.ts` and the memory migration test read the files". The
+repo has a **third** structural test, `lib/__tests__/ai-message-feedback-migration.test.ts`, which
+reads `20260919140000` and asserts its shape. All three are now named in `SYSTEM_DOCS.md`.
+
+**C33 — the "four `20260919*` migrations before it" count was not stale, and the item's premise was
+wrong.** `20260919090000`, `20260919100000`, `20260919110000` and `20260919120000` are exactly four
+before `20260919130000`, so the arithmetic was right. The real defect was that the paragraph never
+mentioned `20260919140000` at all. The text now reads "the four `20260919*` migrations before them",
+which is true of both.
+
+**C34 — the retention response carries a seventh field.** `cutoff` (an ISO string restating
+`cutoffMs`, for the cron log) plus `ok: true`, neither of which the brief listed. Documented from the
+route rather than the brief. The general lesson: a response shape must be read off the route.
+
+**C35 — C18's substance was already in the docs, and one sentence now closes it.** The agentic-pipeline
+section already said "any evicted **document** sets `degraded: \"evidence_evicted\"`", which is the
+precise distinction. What it did not say is that the list now reaches the reader, that
+`PipelineResult.evicted` is never null, and that `ActivityPart.evicted` is optional so
+`PROTOCOL_VERSION` stays `1`. Added in `e0ce400` — the place a reader forms the wrong belief is
+exactly the sentence that states the rule.
+
+**Verified at Task 6's close** (`71289ee` + `e0ce400`): the suite is **unchanged at 91 files / 1,477
+tests** (node 85/1,365, dom 6/112) — a documentation-only change moved nothing, which is the check
+that the file list was respected; `tsc` exit 0; lint 0 errors / 14 warnings. `SYSTEM_DOCS.md` gains a
+106-line `### AI observability` subsection at line 718, at the end of the `## AI Chatbot (DCPH Bot)`
+section and before the `---` preceding `## Profile & Rankings System`, plus an extended `Measured.`
+paragraph and a rewritten `Migration status.` paragraph covering both migrations. `.env.example`
+gains one `AI_LOG_RETENTION_DAYS` group, all existing entries byte-identical.
+
+### C36 — the twelve completion criteria, checked against the tree
+
+Checked against the repository, not against the task reports:
+
+1. **Met.** `npm run test:eval` runs exactly the two eval files, prints
+   `retrieval recall@5 0.9833 (59/60) ≥ 0.85` and `pipeline-level recall 1.0000 (60/60) ≥ 0.85`, and
+   is the CI step `Eval gate (recall)` between Test and Build; `package.json`'s `test` is still
+   exactly `vitest run`, so the suite keeps its own `RECALL_GATE` assertions.
+2. **Met.** `lib/ai/observability/store.ts` answers `summary`, a bounded `recent` and
+   `feedbackSummary`, plus the retention sweep; every bound is a module constant; 28+ tests assert
+   the clamped window and capped limit reached the query.
+3. **Met.** `GET /api/admin/ai-observability` answers both auth paths with one shape and rejects a
+   non-admin session, a wrong secret, a query-string secret, a cross-origin caller and an
+   unparseable edge. The window is clamped by the store, which is the only owner of the bound (C12).
+4. **Met, with C16's recorded gap.** `/admin/ai` renders the summary and recent rows for an admin and
+   the honest empty state when the log is absent. The *component* is tested in both states and the
+   *route*'s failure path is tested; the page's own `requireAdmin()` and `try/catch` are executed by
+   no test, because no vitest project can render an async server component.
+5. **Met.** `PipelineResult.evicted` → optional `ActivityPart.evicted` → the trace's expanded lines,
+   with `PROTOCOL_VERSION` still `1`; `degraded`'s behaviour unchanged and pinned by two tests (C18).
+6. **Met.** `GET /api/admin/ai-retention` defaults to `dry_run=true`, requires `CRON_SECRET` with no
+   session path, touches only `ai_request_log`, and reports `retentionDays`, `cutoffMs`, `cutoff`,
+   `dryRun`, `removed`, `batches`, `exhausted`.
+7. **Met.** `lib/cron-auth.ts` holds the only `headerMatchesSecret`; `app/api/sync/route.ts`,
+   `ai-observability/route.ts`, `ai-retention/route.ts` and `ingest-corpus/route.ts` import it.
+8. **Met.** `vercel.json` has four entries, the two `/api/sync` ones byte-identical to before;
+   `/api/admin/ingest-corpus` answers GET behind `CRON_SECRET` with its POST path unchanged.
+9. **Met.** `SYSTEM_DOCS.md` documents the nineteen columns, the five bounds, the operator surface and
+   its two auth paths, retention with C27's dry-run semantics, the four crons with C28's tier limits,
+   the eval gate, and the D6 cache decision; `.env.example` names `AI_LOG_RETENTION_DAYS`.
+10. **Met.** `git diff --name-only f9504ba..HEAD | grep -c supabase/migrations` is **0** — this phase
+    added no migration — and both migrations are described as committed and not applied.
+11. **Met.** Every task's close was verified independently: full suite in both projects, `tsc` exit 0,
+    lint 0 errors / 14 warnings, build succeeding with the four `/api/ai-chat*` routes plus the new
+    ones.
+12. **Met.** `git diff --quiet -- components/chat/ChatWidget.tsx` holds (worktree equals index) and
+    all ten in-flight paths remain staged; no Plan 6 commit touched one.
+
+**Plan 6's final state:** `f9fbd7f`, `a968048`, `7e4f7dc`, `f9504ba`…`e0ce400` — 91 files /
+1,477 tests, `tsc` exit 0, lint 0 errors / 14 warnings, build green.
+
 ## 6. Task index
 
 | # | Task | Files | Commit |

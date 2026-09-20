@@ -100,7 +100,7 @@ POST /api/ai-chat                                   app/api/ai-chat/route.ts
         data-degraded   { reasons: string[] }            plan 4's degrade vocabulary
         text-delta      the answer, as Plan 1 streams it
         data-citations  { report: CitationReport }       after the stream (D3)
-  → toUIMessageStreamResponse()
+  → createUIMessageStreamResponse()
 
 client                                              components/chat/
   useChatStream (useChat + view-model mapping)        useChatStream.ts
@@ -125,7 +125,7 @@ Three properties this shape exists to keep:
 ## 5. Deviations and decisions taken here
 
 **D1 — The AI SDK frames; Plan 1's gateway answers.** `ai`'s `createUIMessageStream` /
-`toUIMessageStreamResponse` (server) and `@ai-sdk/react`'s `useChat` (client) are used for framing
+`createUIMessageStreamResponse` (server) and `@ai-sdk/react`'s `useChat` (client) are used for framing
 and transport only. The model call stays `streamChat` from `lib/ai/gateway.ts`, so quota accounting,
 the breaker and the repair ladder keep working exactly as Phases 1–4 built them. The alternative —
 adopting a provider package and letting the SDK drive the model call — would create a second path to

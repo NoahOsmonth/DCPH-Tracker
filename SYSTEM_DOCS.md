@@ -661,18 +661,20 @@ the pipeline's own reason (`pipeline_failed`, `corpus_unavailable`, `execute_bud
 `ladder_failed`, `tool_failed`, `retrieval_budget`, `evidence_evicted`, `corpus_static`),
 `screened`, then `uncited`; `plan_ms` is the planner stage's measurement.
 
-**Migration status.** `20260919130000_ai_request_log_pipeline.sql` adds the three columns above
-and is committed but **not applied** to the remote project, like the four `20260919*` migrations
-before it.
-It is additive: three `add column if not exists`, all nullable, no default, and no policy or
-grant — `20260919090000` already enables RLS on `ai_request_log` with no policies, and
+**Migration status.** `20260919130000_ai_request_log_pipeline.sql` (the three columns above) and
+`20260919140000_ai_message_feedback.sql` (the feedback table) are committed but **not applied**
+to the remote project, like the four `20260919*` migrations before them. Applying either is a
+deliberate manual step, and neither a test nor a plan step runs `supabase db push`. The pipeline
+migration is additive: three `add column if not exists`, all nullable, no default, and no policy
+or grant — `20260919090000` already enables RLS on `ai_request_log` with no policies, and
 restating access control is how an additive migration accidentally widens a table only
-`service_role` may touch. No test executes the SQL:
-`lib/__tests__/ai-request-log-migration.test.ts` reads the file and asserts its structure (the
-three columns, their nullability, the absent destructive statements), because CI has no Postgres.
-Applying it is a deliberate manual step, like the others.
+`service_role` may touch. The feedback migration is likewise additive: one
+`create table if not exists` plus two indexes, RLS enabled with no policies and no grants. No
+test executes either SQL: `lib/__tests__/ai-request-log-migration.test.ts`,
+`lib/__tests__/ai-message-feedback-migration.test.ts` and the memory migration test read the
+files and assert their structure, not their effect, because CI has no Postgres.
 
-Manual verification, after applying the migration:
+Manual verification, after applying both migrations:
 
 ```sql
 select column_name, is_nullable, column_default
@@ -681,6 +683,13 @@ select column_name, is_nullable, column_default
    and table_name = 'ai_request_log'
    and column_name in ('plan_source', 'tools', 'citations_valid');
 -- Three rows, each is_nullable = 'YES' with a null column_default.
+
+select column_name, data_type, is_nullable
+  from information_schema.columns
+ where table_schema = 'public'
+   and table_name = 'ai_message_feedback'
+ order by ordinal_position;
+-- id, message_id, user_id, value, note, created_at.
 ```
 
 **Cost.** v2 adds at most one model call per request, and only when `AI_PLANNER=auto` and the
@@ -698,6 +707,118 @@ word-order fix in `lib/chat/query.ts`. The pipeline-level eval
 (`lib/__tests__/pipeline-eval.test.ts`) measures what the assembled prompt actually numbers,
 through the router, the executor, the screener and the assembler over the same 60 cases, at
 **1.0000 (60/60)**.
+
+Both files share `evaluateRetrieval`'s report, whose field is `recallAt5`, and the gate is
+`RECALL_GATE` (0.85) at `EVAL_K` (5). `npm run test:eval` runs exactly those two files and prints
+each measured recall as one line, and `.github/workflows/ci.yml` runs it as its own step named
+**"Eval gate (recall)"** between "Test" and "Build", so a slow erosion toward the gate is visible
+in the CI log rather than buried in the suite's output. The full suite keeps its own copy of the
+assertion, so the gate cannot be removed by deleting a CI line.
+
+### AI observability
+
+**What the log carries.** `ai_request_log` is one row per chat request, written by
+`lib/ai/request-log.ts` and read by `lib/ai/observability/store.ts`. Its nineteen columns are the
+sixteen from `20260919090000_ai_gateway_infra.sql` — `id`, `user_id`, `conversation_id`,
+`target_id`, `outcome`, `plan_ms`, `retrieve_ms`, `ttft_ms`, `total_ms`, `attempts`, `doc_count`,
+`cache_hit`, `degraded_reason`, `prompt_tokens`, `completion_tokens`, `created_at` — plus the
+three the pipeline added (`plan_source`, `tools`, `citations_valid`), which "The request log"
+above describes. Two indexes, `(created_at desc)` and `(user_id, created_at desc)`, are what make
+a windowed read bounded, and the table is RLS-enabled with no policies, so every read on this
+surface goes through `createAdminClient()`.
+
+**The read side and its bounds.** `lib/ai/observability/store.ts` is a port, a Supabase adapter
+and a policy layer, in the shape `lib/ai/feedback/store.ts` establishes. `summary` answers one
+window; `recent` answers the newest rows; `feedbackSummary` joins the up/down/noted vote counts
+from `ai_message_feedback`; `retention` sweeps expired rows. Every bound is a constant in that
+module, and the policy layer clamps whatever a caller hands it, so no caller can widen one:
+
+| Constant | Value | Meaning |
+| --- | --- | --- |
+| `DEFAULT_WINDOW_MS` | `86_400_000` (24 h) | the window when a caller omits an edge |
+| `MAX_WINDOW_MS` | `2_592_000_000` (30 d) | the ceiling; the older edge moves, `untilMs` does not |
+| `RECENT_ROW_LIMIT` | `200` | `recent()`'s default **and** ceiling |
+| `PERCENTILE_SAMPLE_CAP` | `1000` | rows a `summary` reads for buckets and latency |
+| `NULL_BUCKET` | `"none"` | the key a null reason or null source is counted under |
+
+The one distinction a reader must not miss: `requestCount` is **exact** — a `head` count that
+transfers no rows — while the breakdowns by `outcome`, `degraded_reason`, `plan_source` and
+`citations_valid` are computed from a row sample capped at `PERCENTILE_SAMPLE_CAP`. The summary
+therefore carries `sampled` and `sampledRows`, so a capped breakdown is never presented as the
+whole window. A null `degraded_reason` (no degradation) and a null `plan_source` (a v1 request)
+are counted under `NULL_BUCKET`, not dropped, and `latency.*.count` is the number of non-null
+samples rather than the row count — a stage that did not run has no latency, and counting it as
+zero would make the median of a window that never retrieved anything look fast.
+
+**The operator surface.** The page at `/admin/ai` (`app/(app)/admin/ai/page.tsx`) is a server
+component: it calls `requireAdmin()` — the admin layout already does, and this is defence in
+depth — reads the store directly with the service-role client (D1) and renders
+`components/admin/AiObservabilityReport.tsx`. A missing table renders as "the request log is not
+available yet" rather than a crash, which is the deployed project's real state: none of the
+`20260919*` migrations are applied, so every store method rejects.
+
+The JSON route `GET /api/admin/ai-observability` accepts `since`/`until` (ISO timestamps or epoch
+milliseconds; an unparseable edge is a 400) and answers `{ summary, recent, feedback }` with
+`Cache-Control: no-store`. It has two ways in: an **admin session**, or the **`CRON_SECRET`
+Bearer header**, compared in constant time by `lib/cron-auth.ts`. The secret grants no wider a
+query — the same window is parsed, the same store answers, the same body comes back. The route
+carries no copy of the window bound: it passes the caller's edges through, the store clamps them,
+and the summary reports the window that was actually read.
+
+**The retention policy.** `GET /api/admin/ai-retention` is `CRON_SECRET` **only** — there is no
+session path, so an admin browser tab cannot delete log rows. `DEFAULT_RETENTION_DAYS = 90`,
+overridable by `AI_LOG_RETENTION_DAYS`; an absent, unparseable, non-integer, zero or negative
+value falls back to 90, never to 0. A batch is `RETENTION_BATCH_ROWS = 200` and one invocation
+runs at most `RETENTION_MAX_BATCHES = 20` of them, so a single call is bounded at 4,000 rows. The
+cutoff is `now - retentionDays() * 86_400_000`, and the response reports `retentionDays`,
+`cutoffMs` (with an ISO `cutoff` string for the cron log), `dryRun`, `removed`, `batches` and
+`exhausted`.
+
+`exhausted: false` means the run stopped at a bound with expired rows still present, so a partial
+sweep is never reported as complete. The default is a dry run: only `?dry_run=false` deletes. A
+dry run cannot page — the next read would return the same ids — so it reads exactly one 200-row
+batch; its `removed` therefore means "the first 200 it would remove", and `exhausted` is the
+signal that more remain. The sweep deliberately does **not** go through the store's windowed
+reads: `resolveWindow` clamps every window to `MAX_WINDOW_MS` (30 days), so a 90-day cutoff
+routed through it would silently under-report by a factor of three while reporting the sweep as
+complete. `ai_message_feedback` is never pruned (D3) — it is small, one row per message per user,
+and it is the quality signal.
+
+**The crons.** `vercel.json` declares four entries; the first two are pre-existing.
+
+| Path | Schedule |
+| --- | --- |
+| `/api/sync?mode=airing` | `23 0 * * *` |
+| `/api/sync?mode=seed` | `0 3 * * 1` |
+| `/api/admin/ai-retention?dry_run=false` | `17 4 * * *` |
+| `/api/admin/ingest-corpus` | `41 5 * * 0` |
+
+Vercel Cron Jobs issue **GET**, which is why `GET /api/sync` gained a cron path that delegates to
+`POST` when the Bearer secret matches (and otherwise runs its unchanged session-status body), and
+why `/api/admin/ingest-corpus` gained a `GET` handler — its `POST` keeps the `x-admin-secret`
+header and its behaviour, while the `GET` uses the Bearer secret and calls the same `runIngest`.
+On the Hobby (free) tier a cron may fire **at most once per day**, with **±59 minutes** of
+scheduling precision — a schedule states a window, not a minute — and a multi-day expression like
+`0 9 * * 1-5` would be rejected at deploy time. Cron jobs are capped at **100 per project on
+every plan**; all four entries above fire at most daily, so none is rejected. Known gaps in the
+sync route: `maxDuration = 60` may be tight for a seed that does two paginated pulls plus per-row
+image resolution, a GET cron and a manual admin POST share one rate-limit bucket (2 per 60 s), and
+`syncAiring`'s AniList failure fails open by design-accident.
+
+**The response cache (D6).** Unimplemented, and deliberately: the log has never been read and
+there is no measured evidence of repeated identical questions, so a cache now would buy no
+measured need at the cost of a real correctness risk — a stale answer, and a per-user answer
+served from a shared entry. The trigger that would reopen the decision is the log showing the
+same question asked repeatedly inside a short window. `ai_request_log.cache_hit` **already
+exists** (`20260919090000` defines it `boolean not null default false`) and is always `false`
+because nothing writes it, so a future cache needs no migration — only the code that would set
+it. Nothing in this phase writes it.
+
+**Not covered yet.** Plan 5 Tasks 8–11 — the widget rebuilt on `useChatStream`, the conversation
+drawer, the memory panel, and the accessibility/keyboard/mobile pass — are pending precondition
+P1, the user committing their own uncommitted `components/chat/ChatWidget.tsx`, as is Plan 5 Task
+12, the chat UI documentation. The chat surface's own client-side documentation is therefore
+deliberately not in this section.
 
 ---
 

@@ -121,8 +121,9 @@ Three properties this shape exists to keep:
 
 ## 5. Deviations and decisions taken here
 
-**D1 — A server component, not a client fetch, for the operator page.** `app/admin/ai/page.tsx`
-reads the store directly with the service-role client after checking the admin role. A client
+**D1 — A server component, not a client fetch, for the operator page.** `app/(app)/admin/ai/page.tsx`
+(C13: the admin UI lives in the `(app)` route group) reads the store directly with the service-role
+client after checking the admin role. A client
 component fetching an API route would add a round trip, a loading state and a second place the auth
 check could be forgotten. The JSON route exists for the cron and for any future tooling, not for the
 page.
@@ -163,7 +164,7 @@ only the code that would write it. Task 6 must say that, not claim the column wa
 **D7 — No chart library, no new palette.** The operator page renders numbers and short tables in the
 existing tokens. A sparkline is not worth a dependency (constraint 9).
 
-### C1–C5 — corrections found while executing this plan
+### C1–C5 — corrections found while executing Task 1
 
 Recorded as each task completed, in the Plan 4/5 pattern. A correction here overrides the task text
 above it.
@@ -258,13 +259,71 @@ workstream, and any count that excludes them will disagree with a clean checkout
 `lib/__tests__/observability-store.test.ts` (657 lines, 28 tests). The nine in-flight files remain
 staged and `components/chat/ChatWidget.tsx` is untouched.
 
+### C12–C17 — corrections found while executing Task 3
+
+**C12 — my C8 wording contradicted itself, and the resolution is that the store owns the bound.**
+C8 said both "import `MAX_WINDOW_MS`" and (in the dispatch brief) "pass the caller's values
+through". Under pass-through the route never names a bound, so importing the constant would be a
+dead import that only adds a lint warning. The authoritative reading is the behavioural one, and it
+satisfies §6 Task 3 item 1 ("validated and **clamped** to the store's maximum") and §8 criterion 3
+end to end: the route validates and refuses an unparseable edge with a 400, the store clamps, and
+the response's `summary.sinceMs`/`untilMs` report the window actually read. **One bound, in the
+module that owns it.** C8's "import `MAX_WINDOW_MS`" sentence applies only if a future caller
+clamps in the route — do not restate the value as a literal there either.
+
+**C13 — the page path is `app/(app)/admin/ai/page.tsx`; the plan's `app/admin/ai/page.tsx` does not
+exist.** The admin UI lives in the `(app)` route group (as do `/admin/content`, `/admin/sync`,
+`/admin/users`), so the URL is `/admin/ai` but the file is under the group. §5 D1 and §6 Task 3's
+`Files:` header both carried the wrong path.
+
+**C14 — the page must not hand-roll the role check, and the plan's "exactly as `app/api/admin/route.ts`
+does" is the wrong model for a page.** `lib/auth/admin.ts` already exports `requireAdmin()`, and
+`app/(app)/admin/layout.tsx` already calls it for every page beneath it. The page calls it again as
+defence in depth; the route, which has no layout, returns 403 the way `app/api/admin/route.ts` does.
+Two surfaces, two correct answers — the plan conflated them.
+
+**C15 — the vitest project split dictates where the tests can live, and the plan's suggested path was
+impossible.** The dom project's `include` is `components/**/*.test.{ts,tsx}` only, so a JSX test under
+`app/**` is never collected; the node project excludes `components/**`. The route test is therefore
+`app/api/admin/ai-observability/route.test.ts` (node, 16 tests) and the component test is
+`components/admin/__tests__/ai-observability-report.test.tsx` (dom, 11 tests). §6 Task 3's
+`app/admin/__tests__/ai-observability.test.ts` could not have run.
+
+**C16 — an async server component cannot be rendered by either vitest project, so the page's own two
+decisions are covered only indirectly.** React's sync/legacy renderers cannot await an async
+component and there is no jsdom project for `app/**`. The page is therefore deliberately thin — auth,
+store read, render a pure component — and the *behaviours* its branches produce are covered: the
+missing-table state by the component's `status="unavailable"` test, the store-failure path by the
+route's 500 test, and the guard by the same `requireAdmin()` the admin layout already calls. **What
+is not executed by any test is the page's own `requireAdmin()` call and its `try/catch` wiring.** That
+is a real, recorded gap, not an oversight: closing it would need a third vitest project for `app/**`
+with a server-component renderer, which is out of scope here. Task 6's documentation must not claim
+the page is unit-tested.
+
+**C17 — `summary` and `feedbackSummary` resolved their windows independently, so the page could show
+two different windows.** Each method calls `resolveWindow(input, clock())` with `clock` defaulting to
+`Date.now`, and the page and route call them in a `Promise.all`. Two `Date.now()` calls can straddle a
+millisecond, so the summary's reported window and the feedback's window could differ — small, but it
+is exactly the kind of dishonesty this surface exists to avoid, and the page's one-sentence
+explanation would then be wrong about the feedback numbers beside it. Both call sites now read the
+clock **once per request** and inject it through the store's existing `now` seam
+(`createObservabilityStore({ port, now: () => now })`), which is what that seam is for. Pinned by a
+route test asserting the injected clock is fixed (commit `3e9f100`).
+
+**Verified at Task 3's close** (`c9ac0b4` + `3e9f100`): 88 files / **1,404** tests (node 82 files /
+1,298 tests; dom 6 files / 106 tests); `tsc` exit 0; lint 0 errors / 14 warnings; build succeeds with
+`/admin/ai` (2.17 kB / 117 kB first load) and `/api/admin/ai-observability` (256 B) in the route
+table; `npm run test:eval` passes and still prints both measured numbers. Six files in the Task 3
+commit, three in the clock fix. The nine in-flight files remain staged and
+`components/chat/ChatWidget.tsx` is untouched.
+
 ## 6. Task index
 
 | # | Task | Files | Commit |
 | --- | --- | --- | --- |
 | 1 | The named eval gate | `package.json`, `.github/workflows/ci.yml`, the two eval tests | `test(ai): give the golden evals their own CI gate` |
 | 2 | The request-log read side | `lib/ai/observability/store.ts` + test | `feat(ai): read the request log` |
-| 3 | The operator surface | `app/admin/ai/page.tsx`, `app/api/admin/ai-observability/route.ts` + tests | `feat(admin): surface the AI request log` |
+| 3 | The operator surface | `app/(app)/admin/ai/page.tsx`, `app/api/admin/ai-observability/route.ts`, `components/admin/AiObservabilityReport.tsx`, `components/admin/AdminNav.tsx` + tests | `feat(admin): surface the AI request log` |
 | 4 | Surface `report.evicted` | `lib/ai/pipeline/assemble.ts`, `index.ts`, `lib/ai/stream/protocol.ts`, `app/api/ai-chat/route.ts`, `components/chat/ActivityTrace.tsx` + tests | `feat(ai): carry evicted evidence to the reader` |
 | 5 | Cron wiring and retention | `lib/cron-auth.ts` + test, `app/api/admin/ai-retention/route.ts` + test, `app/api/admin/ingest-corpus/route.ts`, `app/api/sync/route.ts`, `vercel.json` | `feat(admin): wire the AI crons and log retention` |
 | 6 | Documentation and the cache decision | `SYSTEM_DOCS.md`, `.env.example` | `docs(ai): document the observability surface` |
@@ -329,18 +388,19 @@ can assert the bounds were applied.
 
 ### Task 3 — The operator surface
 
-**Files:** `app/admin/ai/page.tsx` (new), `app/api/admin/ai-observability/route.ts` (new) +
-`app/admin/__tests__/ai-observability.test.ts` or a route test, plus whatever the existing admin
-tests' shape requires
+**Files:** `app/(app)/admin/ai/page.tsx` (new — see C13), `app/api/admin/ai-observability/route.ts`
+(new), `components/admin/AiObservabilityReport.tsx` (new — see C16), `components/admin/AdminNav.tsx`
+(one entry), plus `app/api/admin/ai-observability/route.test.ts` and
+`components/admin/__tests__/ai-observability-report.test.tsx` (see C15)
 
 1. **The route** (`GET /api/admin/ai-observability`) accepts a `since`/`until` window (ISO or epoch
    ms, validated and clamped to the store's maximum) and answers `{ summary, recent, feedback }`.
    Auth is **admin role or `CRON_SECRET`** (D2): `isSameOrigin` → rate limit → either a constant-time
    `Authorization: Bearer` match or a `profiles.role === "admin"` check → 401/403. The secret path
    and the session path return the same shape.
-2. **The page** (`/admin/ai`) is a server component: it resolves the session, checks the `admin`
-   role exactly as `app/api/admin/route.ts` does, renders the summary (counts, latency, citation
-   rate, feedback split) and the recent-rows table, and returns the honest empty state when the log
+2. **The page** (`/admin/ai`) is a server component: it calls `requireAdmin()` (C14 — not a hand-rolled
+   role query), renders the summary (counts, latency, citation rate, feedback split) and the
+   recent-rows table, and returns the honest empty state when the log
    is empty — which is the deployed project's real state today, since none of the `20260919*`
    migrations are applied. **A missing table must render as "the log is not available yet", not as a
    crash**: the page catches the store's failure and says so.

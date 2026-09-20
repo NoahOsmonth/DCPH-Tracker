@@ -103,6 +103,18 @@ function confidenceLabel(confidence: number): string {
   return `${Math.round(confidence * 100)}%`
 }
 
+/**
+ * The panel as a phone-sized sheet. `h-dvh` makes it the viewport and
+ * `overflow-y-auto` makes it scroll its own content; the primitive's
+ * `top-[50%]` / `translate-y-[-50%]` centring pair only cancels for an element
+ * exactly as tall as the percentage base it resolves against, and `h-dvh` is
+ * the *dynamic* viewport height, so the sheet pins itself to the top rather
+ * than depending on that coincidence. From `sm` up the pair takes over again
+ * and the panel is the centred card it has always been.
+ */
+const SHEET =
+  "h-dvh overflow-y-auto top-0 translate-y-0 sm:h-auto sm:overflow-y-visible sm:top-[50%] sm:translate-y-[-50%]"
+
 export function MemoryPanel({ open, onOpenChange, className }: MemoryPanelProps) {
   // `null` means "never loaded", which is what tells the first-load failure
   // apart from a refresh that failed with a list already on screen.
@@ -186,7 +198,7 @@ export function MemoryPanel({ open, onOpenChange, className }: MemoryPanelProps)
   return (
     <Dialog open onOpenChange={onOpenChange}>
       <DialogContent
-        className={cn("sm:max-w-md", className)}
+        className={cn(SHEET, "sm:max-w-md", className)}
         onOpenAutoFocus={() => {
           openerRef.current = document.activeElement as HTMLElement | null
         }}
@@ -310,7 +322,7 @@ export function MemoryPanel({ open, onOpenChange, className }: MemoryPanelProps)
                           size="icon"
                           aria-label={`Delete ${fact.key}`}
                           onClick={() => setConfirmingId(fact.id)}
-                          className="size-7 shrink-0"
+                          className="size-11 shrink-0 sm:size-7"
                         >
                           <Trash2 aria-hidden className="size-3.5" />
                         </Button>

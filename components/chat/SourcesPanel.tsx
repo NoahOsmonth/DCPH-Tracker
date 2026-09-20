@@ -57,6 +57,21 @@ function unknownNote(unknown: number[]): string {
     : `The answer cited ${ids}, which were not among the sources supplied.`
 }
 
+/**
+ * The modal panel as a phone-sized sheet. `h-dvh` makes it the viewport and
+ * `overflow-y-auto` makes it scroll its own content; the primitive's
+ * `top-[50%]` / `translate-y-[-50%]` centring pair only cancels for an element
+ * exactly as tall as the percentage base it resolves against, and `h-dvh` is
+ * the *dynamic* viewport height, so the sheet pins itself to the top rather
+ * than depending on that coincidence. From `sm` up the pair takes over again
+ * and the panel is the centred card it has always been.
+ *
+ * The inline branch is an `aside` in the chat's own flow and takes none of
+ * this: it has no viewport to fill.
+ */
+const SHEET =
+  "h-dvh overflow-y-auto top-0 translate-y-0 sm:h-auto sm:overflow-y-visible sm:top-[50%] sm:translate-y-[-50%]"
+
 function SourceList({
   refs,
   citations,
@@ -148,7 +163,7 @@ export function SourcesPanel({
     return (
       <Dialog open onOpenChange={onOpenChange}>
         <DialogContent
-          className={className}
+          className={cn(SHEET, className)}
           onOpenAutoFocus={() => {
             openerRef.current = document.activeElement as HTMLElement | null
           }}

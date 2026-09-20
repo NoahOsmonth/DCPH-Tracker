@@ -18,6 +18,7 @@ import { ChatInput } from "@/components/chat/ChatInput"
 import { ChatMessage, type ChatMessageData } from "@/components/chat/ChatMessage"
 import { createClient } from "@/utils/supabase/client"
 import { openAuthModal } from "@/lib/auth-modal"
+import { useCharacterChromeHidden } from "@/lib/character-chrome"
 import type { User as SupabaseUser } from "@supabase/supabase-js"
 
 const GREETING: ChatMessageData = {
@@ -70,6 +71,11 @@ export function ChatWidget() {
 
   const scrollRef = React.useRef<HTMLDivElement>(null)
   const abortRef = React.useRef<AbortController | null>(null)
+
+  // Mobile /characters: while a character dossier sheet is open the global
+  // chat chrome is hidden via CSS — the widget stays mounted, so open state,
+  // messages and auth survive hide/show.
+  const chromeHidden = useCharacterChromeHidden()
 
   // Restore saved messages from sessionStorage on initial client load
   React.useEffect(() => {
@@ -242,7 +248,8 @@ export function ChatWidget() {
           "bg-accent text-white shadow-lg shadow-black/50 ring-1 ring-white/10",
           "transition-transform duration-200 hover:scale-105 hover:bg-accent-bright",
           "focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-bright focus-visible:ring-offset-2 focus-visible:ring-offset-black",
-          open && "scale-90 opacity-0 pointer-events-none"
+          open && "scale-90 opacity-0 pointer-events-none",
+          chromeHidden && "hidden"
         )}
         style={{ height: "3.25rem", width: "3.25rem" }}
       >
@@ -260,7 +267,8 @@ export function ChatWidget() {
             "border border-line bg-surface shadow-2xl shadow-black/70",
             "w-[min(26rem,calc(100vw-1.5rem))] h-[min(34rem,calc(100vh-6rem))]",
             "transition-all duration-200 ease-out",
-            mounted ? "translate-y-0 opacity-100" : "translate-y-4 opacity-0"
+            mounted ? "translate-y-0 opacity-100" : "translate-y-4 opacity-0",
+            chromeHidden && "hidden"
           )}
         >
           <header className="flex items-center justify-between gap-2 border-b border-line px-4 py-3">

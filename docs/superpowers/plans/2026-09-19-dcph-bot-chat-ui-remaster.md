@@ -359,6 +359,34 @@ bundles. The only removals in `ChatMessage.tsx` are the old non-exported props i
 function body, whose classNames moved into shared constants unchanged — so the legacy caller renders
 byte-identically, asserted by a test that pins the exact className strings.
 
+**C29 — Task 9 item 2's "undo affordance" cannot be built, and the task's own file list says why.**
+The route it names, `app/api/ai-chat/conversations/route.ts`, exports only `GET` and `DELETE`, and the
+`DELETE` sets `archived_at` rather than removing the row (D4). Nothing in the API clears that column,
+so a "restore" button would promise a write that does not exist. The repo also has no toast system
+(no sonner, no `useToast`, nothing under `components/ui/`), so item 2's "a toast, not a modal, unless
+the repo's convention says otherwise" resolves to no convention to match. `ConversationDrawer.tsx`
+therefore guards a mis-tap with an inline confirmation in the row — before the request — and
+optimistic removal with rollback on failure after it. The missing undo is stated in the component's
+own header comment so a later reader does not add one. Adding a real undo would need a `PATCH`
+clearing `archived_at`; that is a route change nobody has asked for, and it is not in this plan.
+
+**C30 — Task 10 items 2 and 3 are both wrong about the memory endpoint.** Item 2 claims a "clear all"
+is among "both shapes the route already supports": it is not. `app/api/ai-chat/memory/route.ts`'s
+`DELETE` accepts exactly one shape, `?id=<uuid>`, and rejects anything else with a 400; the
+`MemoryStore` interface it delegates to exposes `list`, `loadActive`, `countActive` and `delete` and no
+bulk method. So the panel deletes one fact at a time and the "clear all" is dropped. Item 3 claims the
+endpoint's answer can be "rendered as the honest empty state (memory is disabled for this
+deployment)": it cannot, and deliberately so — the route's own header comment says `AI_MEMORY` is not
+consulted because "D6 stops extraction and injection, not transparency", and `route.test.ts` pins that
+behaviour in two named tests ("lists facts even when AI_MEMORY is off", "still deletes when AI_MEMORY
+is off"). An off switch therefore produces the *same* `200 { facts, cap }` an on switch produces, and
+no client can tell the two apart from that response alone. Completion criterion 7 nevertheless
+requires "the disabled-memory empty state", so item 3 is implemented by **adding the signal rather
+than dropping the requirement**: the `GET` response gains `memoryEnabled: boolean`, read from the
+`isMemoryEnabled()` helper `lib/chat/persistence.ts` already exports and tests, which is additive,
+touches no schema, and keeps D6 intact — it reports the switch, it does not consult it. The panel
+treats a missing field as unknown and makes no claim, so it stays honest against an older response.
+
 ## 6. Task index
 
 | # | Task | Files | Commit |

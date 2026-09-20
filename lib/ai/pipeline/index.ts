@@ -153,6 +153,18 @@ export interface PipelineResult {
   /** The refs the answer may cite; `length` is the number the log records. */
   evidence: EvidenceRef[]
   /**
+   * What the assembler evicted to fit the budgets, verbatim from its report and
+   * in its order (D5): the dropped document/wiki ids, then `turns:<n>` when
+   * turns were trimmed, then `summary` when the rolling summary was dropped.
+   * Carried out unchanged — nothing downstream recomputes it — and `[]`, never
+   * `null`, when nothing was evicted: that is a fact, not an absence.
+   *
+   * This is not the same list as `degraded`'s `"evidence_evicted"`: that reason
+   * is set only when a document or wiki id was evicted, never for a trimmed turn
+   * or a dropped summary, so a non-empty `evicted` does not imply it.
+   */
+  evicted: string[]
+  /**
    * Why the answer is degraded, in precedence order: `"pipeline_failed"` (a
    * stage threw), `"corpus_unavailable"` (the legacy fallback ran), the
    * execution report's reason (`"execute_budget"`, `"ladder_failed"`,
@@ -307,6 +319,7 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineResult 
       version: "v2",
       messages: assembled.messages,
       evidence: assembled.report.evidence,
+      evicted: assembled.report.evicted,
       degraded,
       planSource: planned.source,
       toolNames,
@@ -444,15 +457,17 @@ async function legacyEvidence(
  * `messages` is empty rather than assembled: the assembler is one of the stages
  * that can have thrown, so calling it again here would be the same throw. The
  * route's refusal gate reads the empty evidence set and answers honestly.
- * `planSource: "fallback"` is the only honest member — no model plan exists and
- * the router's plan never ran to completion — and it is what marks the request
- * as one that produced no usable plan at all.
+ * `evicted` is empty because a total failure evicted nothing — the assembler
+ * never ran to report it. `planSource: "fallback"` is the only honest member —
+ * no model plan exists and the router's plan never ran to completion — and it is
+ * what marks the request as one that produced no usable plan at all.
  */
 function failureResult(timings: PipelineTimings): PipelineResult {
   return {
     version: "v2",
     messages: [],
     evidence: [],
+    evicted: [],
     degraded: PIPELINE_FAILED,
     planSource: "fallback",
     toolNames: [],

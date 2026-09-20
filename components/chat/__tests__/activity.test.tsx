@@ -13,6 +13,7 @@ import {
   PLAN_SOURCE_WORDING,
   activitySummary,
   degradeWording,
+  evictionWording,
   formatDuration,
   totalActivityMs,
   toolVerb,
@@ -133,6 +134,63 @@ describe("ActivityTrace expansion", () => {
     })
 
     expect(screen.getByText("No planner ran")).toBeInTheDocument()
+  })
+})
+
+describe("ActivityTrace evicted evidence", () => {
+  it("words document and wiki ids as sources that did not fit", () => {
+    expect(evictionWording(["entry:6", "entry:5", "wiki:dcw:Ai Haibara"])).toEqual([
+      "3 sources did not fit: entry:6, entry:5, wiki:dcw:Ai Haibara",
+    ])
+  })
+
+  it("words a trimmed-turn marker as turns, never as a source", () => {
+    expect(evictionWording(["turns:2"])).toEqual(["2 earlier turns were trimmed"])
+    expect(evictionWording(["entry:1", "turns:2"])).toEqual([
+      "1 source did not fit: entry:1",
+      "2 earlier turns were trimmed",
+    ])
+    // The turn count is not folded into the source count: a trimmed turn is
+    // earlier conversation, not an evicted source.
+    expect(evictionWording(["turns:2"]).join(" ")).not.toContain("source")
+    expect(evictionWording(["turns:1"])).toEqual(["1 earlier turn was trimmed"])
+  })
+
+  it("words the dropped summary as the summary, never as a source", () => {
+    expect(evictionWording(["summary"])).toEqual(["the earlier conversation summary was dropped"])
+    expect(evictionWording(["turns:2", "summary"]).join(" ")).not.toContain("source")
+    expect(evictionWording(["entry:1", "turns:2", "summary"])).toEqual([
+      "1 source did not fit: entry:1",
+      "2 earlier turns were trimmed",
+      "the earlier conversation summary was dropped",
+    ])
+  })
+
+  it("says nothing for an empty list", () => {
+    expect(evictionWording([])).toEqual([])
+  })
+
+  it("lists each eviction shape in the expansion, worded for what it is", async () => {
+    await renderExpanded({
+      activity: activity({
+        evicted: ["entry:6", "entry:5", "wiki:dcw:Ai Haibara", "turns:2", "summary"],
+      }),
+    })
+
+    const list = screen.getByRole("list", { name: "Evicted evidence" })
+    expect(list).toHaveTextContent("3 sources did not fit: entry:6, entry:5, wiki:dcw:Ai Haibara")
+    expect(list).toHaveTextContent("2 earlier turns were trimmed")
+    expect(list).toHaveTextContent("the earlier conversation summary was dropped")
+    // The collapsed line is unchanged: eviction is detail, not a headline.
+    expect(screen.getByRole("button")).toHaveTextContent(
+      "2 steps · 1.2 s · searched the catalog, looked up a character"
+    )
+  })
+
+  it("renders no eviction list when the server sent none", async () => {
+    await renderExpanded({ activity: ACTIVITY })
+
+    expect(screen.queryByRole("list", { name: "Evicted evidence" })).not.toBeInTheDocument()
   })
 })
 

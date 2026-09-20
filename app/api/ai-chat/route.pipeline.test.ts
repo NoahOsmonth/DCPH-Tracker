@@ -311,6 +311,7 @@ function assembledResult(
     version: "v2",
     messages,
     evidence: report.evidence,
+    evicted: report.evicted,
     degraded: null,
     planSource: "router",
     toolNames: ["lookup_character"],
@@ -640,6 +641,29 @@ describe("POST /api/ai-chat through the agentic pipeline", () => {
     expect(answerText(message)).toBe(answer)
     // A clean turn reports no degradation at all.
     expect(dataPart(message, PARTS.degraded)).toBeUndefined()
+  })
+
+  it("sends the pipeline's evicted ids, not a second computation", async () => {
+    // The real assembler evicts two of three oversized documents, so the ids the
+    // route sends are the assembler's own report, carried through the pipeline
+    // result unchanged (D5). A route that re-derived the list would be a second
+    // answer to the same question.
+    const big = (n: number): CorpusDocument => ({
+      ...doc(n),
+      id: `entry:big-${n}`,
+      body: "x".repeat(4000),
+    })
+    const result = assembledResult(scored(big(1), big(2), big(3)))
+    runPipeline.mockResolvedValue(result)
+    vi.stubGlobal("fetch", vi.fn(async () => providerResponse(sse("Answer [E1]."))))
+    const { POST } = await import("@/app/api/ai-chat/route")
+
+    const { message } = await readStream(await POST(post({ message: USER_MESSAGE })))
+
+    expect(result.evicted).toEqual(["entry:big-3", "entry:big-2"])
+    const activity = dataPart(message, PARTS.activity)
+    if (!isActivityPart(activity)) throw new Error("no activity part")
+    expect(activity.evicted).toEqual(result.evicted)
   })
 
   it("sends the pipeline's own degrade reason before the answer", async () => {

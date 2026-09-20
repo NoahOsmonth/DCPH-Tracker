@@ -256,6 +256,8 @@ describe("runPipeline in v2", () => {
     expect(result.evidence).toEqual([
       { n: 1, id: "character:ai-haibara", tag: "[RET]", label: "Ai Haibara" },
     ])
+    // Nothing evicted is a fact, not an absence: the list is empty, never null.
+    expect(result.evicted).toEqual([])
     expect(result.screening).toEqual({ excluded: [], matches: 0, redacted: 0 })
     expect(result.toolNames).toEqual(["lookup_character"])
 
@@ -340,6 +342,66 @@ describe("runPipeline in v2", () => {
     expect(sharedPrefix(left, right)).toBeGreaterThanOrEqual(
       "SYSTEM PROMPT\n\n## What you remember about this user".length
     )
+  })
+})
+
+/* ------------------------------------------------------------------ */
+/* Evicted evidence (D5)                                               */
+/* ------------------------------------------------------------------ */
+
+describe("the evicted list", () => {
+  it("carries the assembler's evicted ids unchanged, in eviction order", async () => {
+    // Three documents over the 1800-token evidence ceiling, so the assembler
+    // evicts from the tail of the ranked order. The ids reach the result in the
+    // assembler's own order, with nothing filtered or re-derived.
+    const body = "x".repeat(4000)
+    executeSpy.mockImplementationOnce(async () =>
+      executeReport({
+        docs: scored(
+          doc("entry:ep-1", "Episode 1", body),
+          doc("entry:ep-2", "Episode 2", body),
+          doc("entry:ep-3", "Episode 3", body)
+        ),
+      })
+    )
+
+    const result = await pipeline(input())
+
+    expect(result.evicted).toEqual(["entry:ep-3", "entry:ep-2"])
+    expect(result.evidence.map((ref) => ref.id)).toEqual(["entry:ep-1"])
+    // Document eviction is the one shape that degrades the request.
+    expect(result.degraded).toBe("evidence_evicted")
+  })
+
+  it("carries a trimmed-turn marker without degrading the request", async () => {
+    // Five 1000-char turns are over the 800-token turns ceiling; the assembler
+    // trims oldest-first. `turns:2` is not an evicted source, so it must not set
+    // `evidence_evicted` — that badge is about sources that did not fit, and a
+    // trimmed turn is not one. This is the test that fails if the degrade feed
+    // is ever widened to `evicted.length > 0`.
+    resolveSpy.mockImplementationOnce(async () => deps())
+    const turns = Array.from({ length: 5 }, (_, index) => ({
+      role: "user" as const,
+      content: `turn-${index} `.padEnd(1000, "y"),
+    }))
+
+    const result = await pipeline(input({ priorTurns: turns }))
+
+    expect(result.evicted).toEqual(["turns:2"])
+    expect(result.degraded).toBeNull()
+    expect(result.messages.filter((message) => message.role === "user")).toHaveLength(3)
+  })
+
+  it("carries a dropped-summary marker without degrading the request", async () => {
+    resolveSpy.mockImplementationOnce(async () => deps())
+    const summary = "Earlier conversation. ".repeat(100)
+
+    const result = await pipeline(input({ summary }))
+
+    expect(result.evicted).toEqual(["summary"])
+    // The summary is not a source either, so this too must not degrade.
+    expect(result.degraded).toBeNull()
+    expect(result.messages[0].content).not.toContain(summary)
   })
 })
 
@@ -499,6 +561,8 @@ describe("a stage that throws", () => {
     expect(result.degraded).toBe("pipeline_failed")
     expect(result.evidence).toEqual([])
     expect(result.toolNames).toEqual([])
+    // A total failure evicted nothing: the assembler never ran to report it.
+    expect(result.evicted).toEqual([])
     expect(result.screening).toEqual({ excluded: [], matches: 0, redacted: 0 })
     // No messages: the assembler can be the stage that threw, so the result
     // carries nothing rather than calling it a second time.

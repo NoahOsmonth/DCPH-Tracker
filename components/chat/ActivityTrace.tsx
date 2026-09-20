@@ -27,6 +27,8 @@ import { badgeVariants } from "@/components/ui/badge"
 import { buttonVariants } from "@/components/ui/button"
 import {
   DEGRADED_REASONS,
+  SUMMARY_EVICTION_MARKER,
+  TURN_EVICTION_MARKER,
   type ActivityPart,
   type DegradedReason,
 } from "@/lib/ai/stream/protocol"
@@ -152,6 +154,59 @@ function formatTiming(ms: number | null): string {
   return ms === null ? "not measured" : `${ms} ms`
 }
 
+/**
+ * The evicted list as reader-facing lines, one per shape the assembler can put
+ * in it — because the three shapes are not the same thing and one line for all
+ * of them would misdescribe two of them:
+ *
+ * - document/wiki ids are sources: "3 sources did not fit: entry:6, entry:5, …";
+ * - `turns:<n>` is not a source. A trimmed turn is earlier conversation, so
+ *   counting it as a source would be a lie about what was dropped;
+ * - `summary` is not a source either: it is the dropped earlier-conversation
+ *   summary.
+ *
+ * The assembler appends its markers after the ids, so the list is read from the
+ * end — a trailing summary, then a trailing turn count, then everything left is
+ * an evicted source. Reading the prefixes instead would mistake a document
+ * whose id happened to be `turns:5` or `summary` for a marker.
+ *
+ * Pure and exported so the wording is testable without rendering. It measures
+ * nothing: the server sent the list and this only words it.
+ */
+export function evictionWording(evicted: readonly string[]): string[] {
+  let end = evicted.length
+  let summaryDropped = false
+  let trimmedTurns = 0
+
+  if (end > 0 && evicted[end - 1] === SUMMARY_EVICTION_MARKER) {
+    summaryDropped = true
+    end -= 1
+  }
+  const turnMarker = end > 0 ? evicted[end - 1] : ""
+  const turnCount = turnMarker.startsWith(TURN_EVICTION_MARKER)
+    ? Number(turnMarker.slice(TURN_EVICTION_MARKER.length))
+    : 0
+  // A non-integer suffix is not a turn marker the assembler writes, so it stays
+  // in the source list rather than being read as a count.
+  if (Number.isInteger(turnCount) && turnCount > 0) {
+    trimmedTurns = turnCount
+    end -= 1
+  }
+
+  const sources = evicted.slice(0, end).filter((entry) => entry.length > 0)
+  const lines: string[] = []
+  if (sources.length > 0) {
+    lines.push(
+      `${sources.length} ${sources.length === 1 ? "source" : "sources"} did not fit: ${sources.join(", ")}`
+    )
+  }
+  if (trimmedTurns > 0) {
+    lines.push(`${trimmedTurns} earlier ${trimmedTurns === 1 ? "turn was" : "turns were"} trimmed`)
+  }
+  if (summaryDropped) lines.push("the earlier conversation summary was dropped")
+  return lines
+}
+
 export interface ActivityTraceProps {
   /** The server's activity part, or `null` when the turn carried none. */
   activity: ActivityPart | null
@@ -170,6 +225,9 @@ export function ActivityTrace({ activity, degraded = [], className }: ActivityTr
   if (activity === null) return null
 
   const summary = activitySummary(activity)
+  // The collapsed line is unchanged by eviction; only the expansion lists it,
+  // and an absent or empty list renders nothing.
+  const evictionLines = evictionWording(activity.evicted ?? [])
 
   // The container owns the key handler so Escape works wherever focus sits
   // inside the trace, including a reason badge a reader tabbed to.
@@ -238,6 +296,13 @@ export function ActivityTrace({ activity, degraded = [], className }: ActivityTr
             ))}
           </dl>
           <p className="mt-1.5 text-ink-dim">{planSourceWording(activity.planSource)}</p>
+          {evictionLines.length > 0 && (
+            <ul aria-label="Evicted evidence" className="mt-1.5 space-y-0.5 text-ink-dim">
+              {evictionLines.map((line, index) => (
+                <li key={`${index}-${line}`}>{line}</li>
+              ))}
+            </ul>
+          )}
         </motion.div>
       )}
     </div>

@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest"
 import type { CitationReport } from "@/lib/ai/citations"
+import {
+  SUMMARY_EVICTION,
+  TURN_EVICTION_PREFIX,
+} from "@/lib/ai/pipeline/assemble"
 import type { EvidenceRef } from "@/lib/ai/pipeline/assemble"
 import type { PipelineResult } from "@/lib/ai/pipeline"
 import {
@@ -11,7 +15,9 @@ import {
   PROTOCOL_VERSION,
   RATE_LIMITED_REASON,
   ROUTE_DEGRADE_REASONS,
+  SUMMARY_EVICTION_MARKER,
   SYNTHETIC_STATE_REASONS,
+  TURN_EVICTION_MARKER,
   buildActivityPart,
   buildCitationsPart,
   buildDegradedPart,
@@ -52,6 +58,7 @@ function pipeline(overrides: Partial<PipelineResult> = {}): PipelineResult {
     version: "v2",
     messages: [],
     evidence: EVIDENCE,
+    evicted: [],
     degraded: null,
     planSource: "router",
     toolNames: ["lookup_character"],
@@ -119,6 +126,30 @@ describe("buildActivityPart", () => {
     part.tools.push("search_cases")
 
     expect(result.toolNames).toEqual(["lookup_character"])
+  })
+
+  it("omits the evicted list when nothing was evicted", () => {
+    const part = buildActivityPart({ pipeline: pipeline(), retrieveMs: 0 })
+
+    // Not `[]`: an empty list is omitted, so a response that evicted nothing
+    // keeps v1's exact shape rather than gaining a field that says nothing.
+    expect(part).not.toHaveProperty("evicted")
+  })
+
+  it("carries a non-empty evicted list, copied", () => {
+    const evicted = ["entry:6", "entry:5", "turns:2", "summary"]
+    const result = pipeline({ evicted })
+    const part = buildActivityPart({ pipeline: result, retrieveMs: 0 })
+
+    expect(part.evicted).toEqual(evicted)
+    expect(part.evicted).not.toBe(evicted)
+    part.evicted?.push("entry:4")
+    expect(result.evicted).toEqual(evicted)
+  })
+
+  it("omits the evicted list on the v1 shape", () => {
+    // There is no pipeline to carry from, so there is nothing to say.
+    expect(buildActivityPart({ pipeline: null, retrieveMs: 1 })).not.toHaveProperty("evicted")
   })
 })
 
@@ -205,12 +236,31 @@ describe("the degrade vocabulary", () => {
 })
 
 /* ------------------------------------------------------------------ */
+/* The eviction vocabulary                                             */
+/* ------------------------------------------------------------------ */
+
+describe("the eviction vocabulary", () => {
+  it("mirrors the assembler's own markers, so the copy cannot drift", () => {
+    // The duplication is deliberate: this module is imported by a client
+    // component, so it must stay browser-bundle-safe and cannot value-import
+    // the assembler's constants. This assertion is what keeps the two equal.
+    expect(TURN_EVICTION_MARKER).toBe(TURN_EVICTION_PREFIX)
+    expect(SUMMARY_EVICTION_MARKER).toBe(SUMMARY_EVICTION)
+  })
+})
+
+/* ------------------------------------------------------------------ */
 /* Guards                                                              */
 /* ------------------------------------------------------------------ */
 
 describe("the part guards", () => {
   it("accept a part the builders produced", () => {
     expect(isActivityPart(buildActivityPart({ pipeline: pipeline(), retrieveMs: 1 }))).toBe(true)
+    expect(
+      isActivityPart(
+        buildActivityPart({ pipeline: pipeline({ evicted: ["turns:2"] }), retrieveMs: 1 })
+      )
+    ).toBe(true)
     expect(isActivityPart(buildActivityPart({ pipeline: null, retrieveMs: 1 }))).toBe(true)
     expect(isEvidencePart(buildEvidencePart(pipeline()))).toBe(true)
     expect(isDegradedPart(buildDegradedPart(["screened"]))).toBe(true)
@@ -245,6 +295,34 @@ describe("the part guards", () => {
         timings: { planMs: null, retrieveMs: null, assembleMs: null },
       })
     ).toBe(false)
+  })
+
+  it("accept an activity part whose evicted list is absent or well-formed", () => {
+    const base = {
+      protocol: 1,
+      planSource: null,
+      tools: [],
+      timings: { planMs: null, retrieveMs: null, assembleMs: null },
+    }
+
+    // Absent is the common case and must keep passing; an empty list is valid
+    // even though the builder never sends one.
+    expect(isActivityPart(base)).toBe(true)
+    expect(isActivityPart({ ...base, evicted: [] })).toBe(true)
+    expect(isActivityPart({ ...base, evicted: ["entry:6", "turns:2", "summary"] })).toBe(true)
+  })
+
+  it("reject a malformed evicted list", () => {
+    const base = {
+      protocol: 1,
+      planSource: null,
+      tools: [],
+      timings: { planMs: null, retrieveMs: null, assembleMs: null },
+    }
+
+    expect(isActivityPart({ ...base, evicted: "none" })).toBe(false)
+    expect(isActivityPart({ ...base, evicted: [1] })).toBe(false)
+    expect(isActivityPart({ ...base, evicted: null })).toBe(false)
   })
 
   it("reject a malformed evidence or degraded payload", () => {

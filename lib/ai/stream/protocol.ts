@@ -65,7 +65,27 @@ export interface ActivityPart {
     retrieveMs: number | null
     assembleMs: number | null
   }
+  /**
+   * What the assembler evicted, when it evicted anything: the dropped
+   * document/wiki ids, then `turns:<n>` (see `TURN_EVICTION_MARKER`), then
+   * `summary` (see `SUMMARY_EVICTION_MARKER`) — the pipeline's list, verbatim.
+   * Omitted when the list is empty, so the common response keeps v1's exact
+   * shape and `PROTOCOL_VERSION` stays `1`: an optional field is not a shape
+   * change, and a client that does not read it is unaffected.
+   */
+  evicted?: string[]
 }
+
+/**
+ * The two non-source markers `evicted` can carry, as reader-facing string
+ * values. They mirror `assemble.ts`'s exported `TURN_EVICTION_PREFIX` and
+ * `SUMMARY_EVICTION`; the duplication is deliberate, because this module must
+ * stay browser-bundle-safe and importing the assembler would pull the whole
+ * retrieval path into the browser bundle. `lib/__tests__/stream-protocol.test.ts`
+ * asserts each pair is equal, so the two cannot drift.
+ */
+export const TURN_EVICTION_MARKER = "turns:"
+export const SUMMARY_EVICTION_MARKER = "summary"
 
 /** The degrade vocabulary, as strings — the client owns the wording (Task 6). */
 export interface DegradedPart {
@@ -153,7 +173,7 @@ export function buildActivityPart(input: {
     }
   }
 
-  return {
+  const part: ActivityPart = {
     protocol: PROTOCOL_VERSION,
     planSource: input.pipeline.planSource,
     tools: [...input.pipeline.toolNames],
@@ -163,6 +183,12 @@ export function buildActivityPart(input: {
       assembleMs: input.pipeline.timings.assembleMs,
     },
   }
+  // Only when there is something to say: an empty list is omitted rather than
+  // sent as `[]`, so a response that evicted nothing keeps v1's exact shape.
+  // Copied, like the tools, so a later mutation of the result cannot rewrite
+  // what was already sent.
+  if (input.pipeline.evicted.length > 0) part.evicted = [...input.pipeline.evicted]
+  return part
 }
 
 /** The evidence refs, copied so a later mutation of the result cannot rewrite
@@ -215,6 +241,9 @@ export function isActivityPart(value: unknown): value is ActivityPart {
       value.planSource === "model" ||
       value.planSource === "fallback") &&
     isStringArray(value.tools) &&
+    // Optional: absent is valid (the common case), but a present value must be
+    // a string list — a malformed one must not reach the renderer.
+    (value.evicted === undefined || isStringArray(value.evicted)) &&
     isRecord(timings) &&
     isNullableNumber(timings.planMs) &&
     isNullableNumber(timings.retrieveMs) &&

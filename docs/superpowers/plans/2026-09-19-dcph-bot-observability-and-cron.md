@@ -163,6 +163,40 @@ only the code that would write it. Task 6 must say that, not claim the column wa
 **D7 — No chart library, no new palette.** The operator page renders numbers and short tables in the
 existing tokens. A sparkline is not worth a dependency (constraint 9).
 
+### C1–C5 — corrections found while executing this plan
+
+Recorded as each task completed, in the Plan 4/5 pattern. A correction here overrides the task text
+above it.
+
+**C1 — Task 1's `Files:` header omits the file its own item 4 mandates.** §6 Task 1 lists
+`package.json`, `ci.yml` and "the two eval tests", but item 4 requires a new guard test — and the
+task index's Delta column says "+1 guard test". The guard lives at
+`lib/__tests__/eval-gate.test.ts`.
+
+**C2 — Task 1's guard did not pin the workflow step, and that is the hole D4 exists to close.**
+Deleting the `Eval gate (recall)` step from `ci.yml` left every other test green and the gate
+invisible again. A fourth assertion in `lib/__tests__/eval-gate.test.ts` now reads `ci.yml` and
+requires both the step name and `npm run test:eval` (commit `a968048`).
+
+**C3 — D4's cost is real and unstated.** The step re-runs both eval files that "Test" already ran,
+adding ~4.3 s per CI run. That is the intended trade — visibility for seconds — but D4 reads as if
+the step were free.
+
+**C4 — "Both eval files print their measured value" is per file, not per test.**
+`pipeline-eval.test.ts` has two tests that compute recall (the gate test and the determinism test);
+only the gate test prints, so the file emits one line, as D4's "a single line" requires. A reviewer
+should not expect two lines from it.
+
+**C5 — The pipeline report's field is `recallAt5`, not `recall`.** Both evals share
+`evaluateRetrieval`'s report, whose field is `recallAt5`; the gate is `RECALL_GATE = 0.85` with
+`EVAL_K = 5`. Task 6 must document the gate with those real names and the real measured numbers
+(retrieval 0.9833, 59/60; pipeline 1.0000, 60/60).
+
+**Verified at Task 1's close** (`f9fbd7f` + `a968048`): 85 files / 1,348 tests (node 80 files /
+1,253 tests; dom 5 files / 95 tests); `tsc` exit 0; lint 0 errors / 14 warnings; build succeeds with
+the four `/api/ai-chat*` routes. `npm run test:eval` runs exactly the two eval files and prints
+`retrieval recall@5 0.9833 (59/60) ≥ 0.85` and `pipeline-level recall 1.0000 (60/60) ≥ 0.85`.
+
 ## 6. Task index
 
 | # | Task | Files | Commit |

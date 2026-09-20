@@ -12,6 +12,11 @@ Page: `app/(app)/characters/page.tsx` → `components/characters/CharactersExplo
    (`getNodeRadius`), palette, labels, and `PARTICLE_COUNT = 30` are unchanged.
    No node/edge/element is ever removed, hidden by LOD, or downscaled.
    Particles are NOT reduced — they are only *frozen while a gesture is active*.
+
+   > Superseded in part by upstream PR #15, which landed while this branch was
+   > open: `PARTICLE_COUNT` is now `isLowEndDevice ? 8 : 30` and the particle
+   > cadence is 4 on a low-end device. The gesture freeze above is additive and
+   > still applies. See the merge commit for the reconciliation.
 2. **"Edge culling" means skipping work, not hiding edges.** Existing behavior
    (loop §3): an edge whose both endpoints are off-screen skips the `d`
    recompute; its last-drawn path stays in the DOM and the world `<g>` transform

@@ -362,6 +362,94 @@ run: appending a value import fails it with the offending line quoted (commit `c
 `pipeline-level recall 1.0000 (60/60) ≥ 0.85`. `PROTOCOL_VERSION` remains `1`, and the
 browser-target bundle of `protocol.ts` is still 3.8 kB with zero `import`/`require` statements.
 
+### C23–C31 — corrections found while executing Task 5
+
+**C23 — the plan's regression proof for the `headerMatchesSecret` extraction did not exist.**
+§3 ("the only copy in the repo"), §6 Task 5 item 1 ("its existing tests are the regression proof that
+the extraction changed nothing") and §7's risk table all assert that `app/api/sync/route.ts` has
+tests. It has none: `app/api/sync/` held only `route.ts`, and no test file imported it. The
+extraction's safety therefore rested on the moved body being byte-identical plus
+`lib/__tests__/cron-auth.test.ts`. **Closed in `8265118`** — `app/api/sync/route.test.ts` now exists
+(10 tests, then 12), covering the GET cron delegation, the session status body, the wrong/absent
+secret paths, the query-string refusal and the guard order. Two related staleness points: §3's "the
+only copy in the repo" was already false when Task 5 started (Task 3 had added a second copy in
+`ai-observability/route.ts`), and the new file needed a **chainable thenable Supabase stub** rather
+than the plain object the other route tests use, because this route queries the database itself
+instead of delegating every read to a mocked collaborator.
+
+**C24 — the two existing `vercel.json` crons had never run.** Vercel Cron Jobs issue **GET**, and
+`GET /api/sync` was a session-only status endpoint taking no request argument and ignoring `?mode=`.
+So `/api/sync?mode=airing` and `/api/sync?mode=seed` returned 401 to every cron invocation, and had
+done since they were added. Task 5 item 4's "do not change or remove the two existing entries" was
+only honest once `GET` gained a cron path: it now delegates to `POST` when
+`headerMatchesSecret(authorization, cronSecret())` matches, and otherwise runs the **unchanged**
+session-status body. Two preconditions were checked rather than assumed: `isSameOrigin` returns true
+with no `Origin` header (a cron sends none), and `POST` reads `mode`/`dry_run`/`limit` from
+`request.nextUrl.searchParams`, which a GET request carries.
+
+**C25 — the retention sweep cannot use the store's windowed reads, and the plan never said so.**
+`resolveWindow` clamps every window to `MAX_WINDOW_MS` (30 days). A 90-day retention cutoff routed
+through it would silently clamp to 30 days, so a "count what would be deleted" built on
+`countRequests` would under-report by a factor of three while reporting the sweep as complete. The
+retention path therefore has its own bounded, **unwindowed** read (`select id … lt(created_at, cutoff)
+order created_at asc limit n`) and does not touch `resolveWindow` at all. Pinned by a test that
+asserts the cutoff is the full 90 days and not the 30-day clamp; the negative control (routing the
+cutoff through `resolveWindow`) fails it with `NOW - 30d` against the expected `NOW - 90d`.
+
+**C26 — §6 Task 5's `Files:` header omits `lib/ai/observability/store.ts`.** The retention constants,
+the `AI_LOG_RETENTION_DAYS` reader and the sweep itself all had to live there, because §3's property 2
+says the retention age is a constant in one module and the module that owns the other bounds is the
+store. The `Delta:` line is understated too: the real delta is four new files, six modified
+source/test files, plus `vercel.json`.
+
+**C27 — the dry run reports one batch, not the whole backlog, and the plan's wording invites the
+wrong reading.** A dry run deletes nothing, so it cannot page — the next read would return the same
+ids. It reads exactly one `RETENTION_BATCH_ROWS` (200) batch and reports `exhausted: false` when that
+batch was full. So a dry-run `removed` means "the first 200 it would remove", and `exhausted` is the
+signal that more remain. Task 6 must document this precisely rather than implying `removed` is the
+total expired count.
+
+**C28 — the Vercel Hobby tier does not limit this, and the concern that it might was resolved by
+research rather than assumption.** Task 5's four `vercel.json` entries raised the question of whether
+Hobby's cron limits make the file undeployable. Researched (Vercel's own docs, 2026-09): **cron jobs
+are capped at 100 per project on every plan** — the old per-team cap of 2 for Hobby was lifted in
+January 2026 — and Hobby's real restriction is that a cron may fire **at most once per day**, with
+±59 minutes of scheduling precision. All four entries satisfy that (`23 0 * * *` daily, `0 3 * * 1`
+weekly, `17 4 * * *` daily, `41 5 * * 0` weekly); a multi-day expression such as `0 9 * * 1-5` would
+be rejected at deploy time, and none is used. So the "$0, free tiers only" constraint holds. The one
+caveat worth documenting is the ±59-minute precision: a schedule states a window, not a minute.
+
+**C29 — `mode` was unvalidated on a path Task 5 made live for the first time.** `POST`'s docblock
+documents `mode=seed|airing|all`, but only `airing` was special-cased — everything else, including a
+typo like `mode=airng`, fell through to the full seed (two paginated pulls plus per-row DCW image
+resolution). That was harmless while no cron could reach the route; once C24 made the crons work, a
+mistyped `vercel.json` path or a stray curl would silently buy an expensive invocation instead of an
+error. The route now validates `mode` against `SYNC_MODES = ["all", "seed", "airing"]` and answers
+400 otherwise, **after** the auth guards so an anonymous caller still gets its 401 rather than
+learning the vocabulary (`3846399`). Safe for every real caller: `lib/actions/admin-system.ts`'s
+`SyncMode` is `"seed" | "airing"` and `vercel.json` uses those two.
+
+**C30 — an unused `rateLimit` import was removed from `app/api/sync/route.ts`.** Only
+`authRateLimitKey` is used; lint is silent on it (the config reports no unused-import rule for this
+file), so it had sat there unremarked. Same commit as C29.
+
+**C31 — three pre-existing sync-route risks are recorded, not fixed.** (a) `maxDuration = 60` covers
+a seed that performs two paginated full syncs plus per-row image resolution, and the airing branch
+paginates too — it may exceed 60 s on Vercel, and Hobby's function ceiling is 300 s if it needs
+raising. (b) A GET cron and a manual admin POST share one rate-limit bucket
+(`sync:post:${pathname}:ip:${ip}`, limit 2/60 s), so a manual POST in the same minute as a cron run
+would 429; the two crons run at different minutes so they do not collide with each other.
+(c) `syncAiring`'s AniList failure fails open (`latestAired` stays `Number.MAX_SAFE_INTEGER`), which
+is plausibly intentional but is not stated. None is in this phase's scope; each is a candidate for a
+later one.
+
+**Verified at Task 5's close** (`74ef3f1` + `8265118` + `3846399`): 91 files / **1,477** tests (node
+85 files / 1,365 tests; dom 6 files / 112 tests); `tsc` exit 0; lint 0 errors / 14 warnings; build
+succeeds with `/api/admin/ai-retention` (258 B) and `/api/sync` (258 B) in the route table;
+`npm run test:eval` passes and still prints both measured numbers. `headerMatchesSecret` now exists
+in exactly one place (`lib/cron-auth.ts`) with four importing routes. The nine in-flight files remain
+staged and `components/chat/ChatWidget.tsx` is untouched.
+
 ## 6. Task index
 
 | # | Task | Files | Commit |
@@ -369,8 +457,8 @@ browser-target bundle of `protocol.ts` is still 3.8 kB with zero `import`/`requi
 | 1 | The named eval gate | `package.json`, `.github/workflows/ci.yml`, the two eval tests | `test(ai): give the golden evals their own CI gate` |
 | 2 | The request-log read side | `lib/ai/observability/store.ts` + test | `feat(ai): read the request log` |
 | 3 | The operator surface | `app/(app)/admin/ai/page.tsx`, `app/api/admin/ai-observability/route.ts`, `components/admin/AiObservabilityReport.tsx`, `components/admin/AdminNav.tsx` + tests | `feat(admin): surface the AI request log` |
-| 4 | Surface `report.evicted` | `lib/ai/pipeline/assemble.ts`, `index.ts`, `lib/ai/stream/protocol.ts`, `app/api/ai-chat/route.ts`, `components/chat/ActivityTrace.tsx` + tests | `feat(ai): carry evicted evidence to the reader` |
-| 5 | Cron wiring and retention | `lib/cron-auth.ts` + test, `app/api/admin/ai-retention/route.ts` + test, `app/api/admin/ingest-corpus/route.ts`, `app/api/sync/route.ts`, `vercel.json` | `feat(admin): wire the AI crons and log retention` |
+| 4 | Surface `report.evicted` | `lib/ai/pipeline/index.ts`, `lib/ai/stream/protocol.ts`, `components/chat/ActivityTrace.tsx` + tests (C19: `assemble.ts` and `app/api/ai-chat/route.ts` needed no change) | `feat(ai): carry evicted evidence to the reader` |
+| 5 | Cron wiring and retention | `lib/cron-auth.ts` + test, `lib/ai/observability/store.ts` + test (C26), `app/api/admin/ai-retention/route.ts` + test, `app/api/admin/ingest-corpus/route.ts` + test, `app/api/admin/ai-observability/route.ts`, `app/api/sync/route.ts` + test (C23), `vercel.json` | `feat(admin): wire the AI crons and log retention` |
 | 6 | Documentation and the cache decision | `SYSTEM_DOCS.md`, `.env.example` | `docs(ai): document the observability surface` |
 
 ---

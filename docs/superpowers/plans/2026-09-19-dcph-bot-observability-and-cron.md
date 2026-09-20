@@ -317,6 +317,51 @@ table; `npm run test:eval` passes and still prints both measured numbers. Six fi
 commit, three in the clock fix. The nine in-flight files remain staged and
 `components/chat/ChatWidget.tsx` is untouched.
 
+### C18–C22 — corrections found while executing Task 4
+
+**C18 — §6 Task 4 item 2's parenthetical is false, and taken literally it is a behaviour change.**
+`AssemblyReport.evicted` holds **three shapes in one list** (document/wiki ids, then `turns:<n>`, then
+`summary`), so `evicted.length > 0` is true for a trimmed turn or a dropped summary alone. But
+`degraded: "evidence_evicted"` is set only when `evictedIds.length > 0` — document evictions. Feeding
+`degradeReason`'s `evicted` argument from the new list's length would therefore newly degrade a
+turn-trim-only request, changing `PipelineResult.degraded`, the `ai_request_log` row and the badge a
+reader sees. The call site is **unchanged** (`assembled.report.degraded === EVIDENCE_EVICTED`) and two
+new tests pin it: a `["turns:2"]` result and a `["summary"]` result must both carry a non-empty
+`evicted` **and** a `null` `degraded`.
+
+**C19 — Task 4's `Files:` header and its "5 modified files" delta are wrong; two of the five needed no
+change.** `lib/ai/pipeline/assemble.ts` already exported `TURN_EVICTION_PREFIX` and
+`SUMMARY_EVICTION`, and `app/api/ai-chat/route.ts` already hands the whole `PipelineResult` to
+`buildActivityPart`, so neither was touched. The real delta is three source files
+(`lib/ai/pipeline/index.ts`, `lib/ai/stream/protocol.ts`, `components/chat/ActivityTrace.tsx`) and
+four test files.
+
+**C20 — "lists the evicted ids in one line ('3 sources did not fit: …')" is only honest for the first
+group.** `turns:<n>` and `summary` are not sources, and the plan's single line would have labeled a
+trimmed turn as a source that "did not fit". The expanded view renders three separate lines — sources
+with their ids, trimmed turns, the dropped summary — from an exported `evictionWording` helper that
+reads the markers from the tail of the list (the order `assemble.ts` writes them in). The collapsed
+line is unchanged.
+
+**C21 — the marker duplication in `protocol.ts` is deliberate, and a test is what keeps it honest.**
+`ActivityTrace.tsx` is a client component, so importing `assemble.ts` for the marker values would pull
+the assembler and its tokenizer into every client bundle that renders a trace. `protocol.ts`
+therefore declares `TURN_EVICTION_MARKER`/`SUMMARY_EVICTION_MARKER` itself, and a node test asserts
+they equal the assembler's exported constants — the copy cannot drift silently.
+
+**C22 — the bundle-safety rule was load-bearing and unpinned.** C21's duplication exists only because
+`protocol.ts` must stay browser-bundle-safe, and nothing in the suite would have noticed a value
+import being added — the rule was verified by hand (an esbuild `--platform=browser` bundle containing
+zero `import`/`require` statements) and would have rotted. A test now reads
+`lib/ai/stream/protocol.ts` and requires every `import` line to be an `import type`. Negative control
+run: appending a value import fails it with the offending line quoted (commit `cd09c7d`).
+
+**Verified at Task 4's close** (`e0c81d2` + `cd09c7d`): 88 files / **1,421** tests (node 82 files /
+1,309 tests; dom 6 files / 112 tests); `tsc` exit 0; lint 0 errors / 14 warnings; build succeeds;
+`npm run test:eval` passes and still prints `retrieval recall@5 0.9833 (59/60) ≥ 0.85` and
+`pipeline-level recall 1.0000 (60/60) ≥ 0.85`. `PROTOCOL_VERSION` remains `1`, and the
+browser-target bundle of `protocol.ts` is still 3.8 kB with zero `import`/`require` statements.
+
 ## 6. Task index
 
 | # | Task | Files | Commit |

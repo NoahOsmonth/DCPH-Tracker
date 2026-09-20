@@ -418,10 +418,20 @@ suite). Tasks 8–12 as written each bundle one frozen-file requirement, which C
 | 11 | `responsive.test.tsx` + 11 tests, sheet sizing and touch targets | `4ec7126` |
 | 12 | The Chat UI section and `.env.example` | `eb9a489` |
 
-Outstanding, all inside `ChatWidget.tsx` and all waiting on P1: the widget rebuilt on `useChatStream`, its
-wiring of the drawer and the panel, the message container's live-region transition (C31), the regenerate
-keyboard path and the composer's viewport placement (C32). Nothing renders the drawer or the panel yet —
-they exist, they are tested, they are prop-driven, and the file that would open them is frozen.
+The remainder shipped once P1 was satisfied — the repo owner committed `ChatWidget.tsx` with the
+`lib/character-chrome.ts` it imports, as one commit, so the tree stayed buildable (`f2dd4cd`). Each of the
+four following commits was verified independently before it landed: scope check, the diff read,
+`npx tsc --noEmit`, the full suite, and `npx eslint` on the changed files.
+
+| Task | Shipped | Commit |
+| --- | --- | --- |
+| 8 | `ChatWidget.tsx` rebuilt on `useChatStream` + 18 tests; the first Escape conflict fixed (C39) | `14edc54` |
+| 9 | The drawer wired in, and `loadConversation` added to the hook to receive a selection (C38) | `297f80c` |
+| 10 | The memory panel wired in | `e491569` |
+| 11 | The live-region transition, the regenerate path and the composer's viewport placement (C31, C32, C40) | `f4607eb` |
+
+The drawer and the memory panel are reachable from the UI as of `297f80c` and `e491569`; nothing in this
+plan is outstanding. The browser acceptance pass that closes it is recorded in C39 and C40.
 
 Two product defects were found by writing the tests, not by reading the code, and both are fixed:
 Radix restores focus only to a `DialogTrigger`, so closing any of these panels left focus on `<body>`
@@ -472,6 +482,38 @@ the panel, and completion criterion 7 requires a disabled-memory state the endpo
 the flag moved to an import-free module the transparency route can read without the provider graph.
 Both are recorded here because criterion 12 asks for every deviation, and a silent edit to a shared
 primitive is exactly the kind a later reader would not expect.
+
+**C38 — Task 9 item 1 was unimplementable as written: the hook had no way to replace the transcript.**
+The item says that selecting a conversation in the drawer "replaces the in-place transcript". It could
+not: `useChatStream` owns `messages` and exposes only `send`, `stop`, `regenerate` and `editAndResend`,
+so the rows the drawer loads had nowhere to go. The capability was added rather than worked around —
+`loadConversation(id, messages)` on the hook's return, and `transcriptToUIMessages` to map the route's
+`{ id, role, content }` rows to `UIMessage[]`. `loadConversation` also adopts the conversation id, so the
+next turn appends to the reopened conversation instead of opening a new one, which is the whole point of
+reopening it. This is why Task 9's delta is a hook change and a widget change, not the drawer alone.
+
+**C39 — two Escape conflicts, both real product defects, both found only by wiring the overlays in.**
+The widget listens for Escape on `window` to close the panel. (a) While an answer was streaming, that
+listener and the one `ChatInput` installed (`6a3ba04`) both fired on one keypress, so Escape stopped the
+answer *and* closed the panel. Fixed with a `streamingRef` the panel's listener reads: Escape during a
+stream belongs to the stream. (b) Radix's dismissable layer calls `preventDefault()` but never
+`stopPropagation()`, so the same window listener fired underneath an open drawer or memory panel and
+closed the panel beneath the overlay. Fixed by gating that listener on `!overlayOpen`. Both fixes were
+mutation-tested — removing either guard fails exactly the tests that pin it and no others. Verified in a
+browser at 360×740: with the drawer open the first Escape closes only the drawer (the panel stays, the
+launcher still reads "Close DCPH Bot") and the second closes the panel; the same holds for the memory
+panel; and Escape during a stream stops the stream, leaves the panel open, restores `role="log"` and
+offers "Regenerate".
+
+**C40 — `100vh` became `100dvh` in the widget panel, and `60vh` became `60dvh` in the two overlays.**
+`app/layout.tsx` sets `interactiveWidget: "resizes-content"`, which is the mechanism that keeps a
+bottom-anchored composer above the on-screen keyboard: the layout viewport shrinks rather than scrolling.
+`vh` does not follow that shrink, so the panel could compute a height taller than the visible area and
+push the composer off it. `dvh` tracks the dynamic viewport, so the claim no longer rests on the meta tag
+alone. Measured in a browser at 360×320: the panel computes `min(34rem, 100dvh - 6rem)` = 224 px — the
+`dvh` branch, not the `34rem` cap — its bottom sits 20 px above the viewport bottom, the composer stays
+inside it and in view, and the transcript area genuinely overflows (client 76 px against scroll 324 px)
+where at 360×740 it does not.
 
 ---
 

@@ -934,10 +934,12 @@ delete, unlike the conversations archive, and it takes exactly one id — the ro
 `MemoryStore` behind it have no bulk shape, so a later reader should not add a "clear all"; the
 guard against a mis-tap is the inline confirmation in the row.
 
-**Accessibility.** The message container's `aria-live="polite"` with `aria-atomic="false"` lives in
-`components/chat/ChatWidget.tsx`, which is frozen and still to be rebuilt; it does not currently
-switch to `off` or `role="log"` when a turn completes, so that transition is part of the pending
-widget work rather than of the shipped components. Focus restoration is handled per panel, not by
+**Accessibility.** The message container's live region lives in `components/chat/ChatWidget.tsx` and
+transitions with the turn: while an answer streams it is `aria-live="polite"` with no `role`, so each
+delta is announced without the container also claiming to be a log; when the turn ends it becomes
+`aria-live="off"` with `role="log"`, so the finished transcript is navigable as a log rather than
+re-announced. `aria-atomic="false"` throughout, so only the changed part is read. Verified in a browser
+in both directions. Focus restoration is handled per panel, not by
 the primitive: Radix restores focus only to a `DialogTrigger`, and these panels are opened by
 controls outside themselves, so each captures `document.activeElement` in `onOpenAutoFocus` and
 returns it in `onCloseAutoFocus` (`SourcesPanel`, `ConversationDrawer`, `MemoryPanel`). Every
@@ -965,16 +967,27 @@ pipeline and therefore which parts the UI receives: v1 sends no evidence part an
 absent, so a v1 deployment shows the answer, the activity trace and any degrade badges, with no
 chips and no sources.
 
-**Not covered yet.** The conversation drawer, the memory panel, the keyboard and screen-reader pass,
-the responsive/touch-target pass and the `memoryEnabled` signal on the memory route have all shipped
-and are committed. What has not is the rebuild of `components/chat/ChatWidget.tsx` itself: its
-wiring of the drawer and the panel, the message container's live-region transition, the regenerate
-keyboard path, and the composer's viewport placement all live inside that one file, which is frozen
-pending P1 — the repo owner's uncommitted work on it, which also introduces a new staged
-`lib/character-chrome.ts` that the widget imports, so no partial commit of it can leave the tree
-buildable. Nothing renders the drawer or the panel yet: they exist, they are tested and they are
-prop-driven, but the widget that would open them is the file that is frozen, so the feature is not
-reachable from the UI. This section documents the components as they ship, not a live surface.
+**What the browser pass measured.** Everything below was observed in a real browser at 360×740 against
+the real widget, not in jsdom, because the claims are geometric and jsdom computes no layout. The panel
+settles at `336×544` with its right and bottom edges 20 px from the viewport, which is
+`w-[min(26rem,calc(100vw-1.5rem))]` and `h-[min(34rem,calc(100dvh-6rem))]`; the composer's form sits
+flush inside the panel's bottom edge (1 px, the border). The drawer and the memory panel are
+full-viewport sheets at this width — `360×740` at `(0,0)`, `position: fixed`, `top: 0`, `height: 740px`,
+`overflow-y: auto` — which is the `h-dvh` branch of `SHEET`, and the exact behaviour the responsive test
+could not observe. The composer's textarea caps at 120 px and scrolls internally (`overflow-y: auto`)
+rather than growing, and the composer stays inside the panel as it grows. At 360×320 the panel takes the
+`dvh` branch of its height (224 px) and the transcript overflows and scrolls. The header's four icon
+controls and the composer's two are 28×28 and 40×40 respectively: both clear the 24 px floor of
+WCAG 2.2 SC 2.5.8, and the 28 px controls are below the 44 px that iOS HIG and SC 2.5.5 recommend, so
+that is a recorded recommendation rather than a defect. Selecting a conversation in the drawer fetches it
+by id and replaces the transcript with plain-text turns (no activity trace, which only the stream
+carries), and closes the drawer.
+
+**Not verified here.** The two reduced-motion branches and the entrance transitions are CSS-driven, and
+the automation tab used for this pass produces no compositor frames, so no animation could be observed
+advancing in it; `prefers-reduced-motion` was not toggled either. Those branches are pinned by
+`components/chat/__tests__/a11y.test.tsx` on class and prop output, not on motion. The 44 px-versus-28 px
+observation above is a measurement, not a judgement about which the design should take.
 
 ---
 

@@ -57,4 +57,13 @@ describe("the named eval gate", () => {
     // `RECALL_GATE` assertions, so `test` stays the plain full run.
     expect(manifest.scripts?.test).toBe("vitest run")
   })
+
+  it("keeps the workflow step that runs it", () => {
+    // Without this, deleting the CI step leaves every other test green and the
+    // gate invisible again, which is the erosion the step exists to prevent.
+    const workflow = readFileSync(new URL("../../.github/workflows/ci.yml", import.meta.url), "utf8")
+
+    expect(workflow).toContain("Eval gate (recall)")
+    expect(workflow).toContain("npm run test:eval")
+  })
 })

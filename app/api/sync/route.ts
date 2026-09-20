@@ -15,7 +15,7 @@ import {
 import { getNextAiringEpisode } from "@/lib/anilist"
 import { pickImageUrl, resolveDcwImagesBatch } from "@/lib/dcw-images"
 import type { Database } from "@/types/database.types"
-import { rateLimit, authRateLimitKey } from "@/lib/rate-limit"
+import { authRateLimitKey } from "@/lib/rate-limit"
 import { rateLimitPersistent } from "@/lib/rate-limit-db"
 import { isSameOrigin } from "@/lib/origin-check"
 import { defaultRuntimeMinutes, isPlausibleRuntime } from "@/lib/runtime-defaults"
@@ -23,6 +23,14 @@ import { defaultRuntimeMinutes, isPlausibleRuntime } from "@/lib/runtime-default
 export const maxDuration = 60
 
 type ContentInsert = Database["public"]["Tables"]["content_entries"]["Insert"]
+
+/**
+ * The accepted `mode` values. `all` and `seed` both run the full pull — the
+ * route has always treated them as one path — and `airing` is the AniList-driven
+ * incremental one. This is the vocabulary the POST docblock documents.
+ */
+const SYNC_MODES = ["all", "seed", "airing"] as const
+type SyncMode = (typeof SYNC_MODES)[number]
 
 /** Either the cookie-bound server client or the service-role admin client. */
 type SyncClient = Awaited<ReturnType<typeof createClient>>
@@ -108,6 +116,18 @@ export async function POST(request: NextRequest) {
         )
       }
       writeClient = admin as unknown as SyncClient
+    }
+
+    // A typo in `mode` must not silently run the expensive seed: everything
+    // unrecognized used to fall through to the two full paginated pulls, so a
+    // mistyped cron path or a stray curl cost a wasted invocation rather than
+    // an error. Validated after the guards, so an unauthenticated caller still
+    // gets its 401 rather than learning the vocabulary.
+    if (!SYNC_MODES.includes(mode as SyncMode)) {
+      return NextResponse.json(
+        { error: `Unknown mode. Expected one of: ${SYNC_MODES.join(", ")}.` },
+        { status: 400 }
+      )
     }
 
     // ── Airing mode: AniList detects new episode → Jikan pulls its detail ──

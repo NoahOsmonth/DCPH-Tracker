@@ -323,4 +323,31 @@ describe("GET /api/sync", () => {
     expect(createAdminClient).not.toHaveBeenCalled()
     expect(getNextAiringEpisode).not.toHaveBeenCalled()
   })
+
+  it("answers 400 for a mistyped mode rather than silently running the seed", async () => {
+    // Every unrecognized mode used to fall through to the two full paginated
+    // pulls, so a mistyped cron path cost an expensive sync instead of an error.
+    const { GET } = await import("@/app/api/sync/route")
+
+    const response = await GET(get("?mode=airng", { authorization: `Bearer ${SECRET}` }))
+
+    expect(response.status).toBe(400)
+    expect(await response.json()).toEqual({
+      error: "Unknown mode. Expected one of: all, seed, airing.",
+    })
+    // The refusal must come before any work, not after a partial pull.
+    expect(getNextAiringEpisode).not.toHaveBeenCalled()
+    expect(getAllEpisodes).not.toHaveBeenCalled()
+  })
+
+  it("validates the mode after the guards, so an unauthenticated caller still gets 401", async () => {
+    // The vocabulary is not secret, but an anonymous caller has no business
+    // learning it: auth first, then the parameter.
+    getUser.mockResolvedValue({ data: { user: null } })
+    const { GET } = await import("@/app/api/sync/route")
+
+    const response = await GET(get("?mode=airng"))
+
+    expect(response.status).toBe(401)
+  })
 })

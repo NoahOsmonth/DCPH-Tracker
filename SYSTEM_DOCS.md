@@ -697,6 +697,13 @@ select column_name, data_type, is_nullable
    and table_name = 'ai_message_feedback'
  order by ordinal_position;
 -- id, message_id, user_id, value, note, created_at.
+
+select indexname
+  from pg_indexes
+ where schemaname = 'public'
+   and tablename = 'ai_message_feedback'
+ order by indexname;
+-- ai_message_feedback_message_idx, ai_message_feedback_message_user_idx.
 ```
 
 **Cost.** v2 adds at most one model call per request, and only when `AI_PLANNER=auto` and the
@@ -821,11 +828,153 @@ exists** (`20260919090000` defines it `boolean not null default false`) and is a
 because nothing writes it, so a future cache needs no migration — only the code that would set
 it. Nothing in this phase writes it.
 
-**Not covered yet.** Plan 5 Tasks 8–11 — the widget rebuilt on `useChatStream`, the conversation
-drawer, the memory panel, and the accessibility/keyboard/mobile pass — are pending precondition
-P1, the user committing their own uncommitted `components/chat/ChatWidget.tsx`, as is Plan 5 Task
-12, the chat UI documentation. The chat surface's own client-side documentation is therefore
-deliberately not in this section.
+### Chat UI
+
+The client half of the chat lives in `components/chat/`. Its transport is one module, its rendering
+is a set of prop-driven components, and the widget that would host them is not rebuilt yet (see
+"Not covered yet" below).
+
+**The transport.** `POST /api/ai-chat` answers an AI SDK UI message stream. The route builds it with
+the standalone `createUIMessageStream` and wraps it with `createUIMessageStreamResponse` (`ai`
+^7.0.107); `toUIMessageStreamResponse` is not a standalone export in this version — it survives only
+as a deprecated method on a `streamText` result, which this route does not use — so a reader looking
+for it in `app/api/ai-chat/route.ts` will not find it. `lib/ai/stream/protocol.ts` is the one module
+both sides import, and it names the four data parts exactly: `data-evidence`, `data-activity`,
+`data-degraded` and `data-citations` (`PARTS`). `useChat` (from `@ai-sdk/react`) owns the wire and
+reports a `status` of `submitted`, `streaming`, `ready` or `error`; there is no `stopped` status in
+the SDK. `useChatStream` adds one, because after an abort the SDK returns to `ready` and cannot say
+whether the reader or the network ended the turn: it keeps its own `ChatStreamStatus` (`idle`,
+`streaming`, `stopped`, `error`) plus a `stoppedMessageId`, so a turn the reader stopped renders as
+stopped rather than complete.
+
+**Two versions that must not be merged.** `AI_PIPELINE`'s `v1`/`v2` is the *pipeline* — plan, gather,
+screen, assemble, cite-validate. `PROTOCOL_VERSION` is the *message-stream envelope's* compatibility
+seam and is currently `1`. They are different axes and move for different reasons. The route's v2
+writes an `evidence` part and a `citations` part; v1 writes neither, so its turns render as text
+plus an activity trace and any degrade badges — that is the plan's "parts on v2, only text on v1",
+and it is about the pipeline. The envelope version travels once, in the `activity` part, and stays
+`1` across that difference: v1 and v2 send the same envelope, an optional field is not a shape
+change, and the version bumps only when a part's payload changes shape. A client that reads a
+version it does not know renders the text alone rather than guess at the data parts' shapes.
+
+**The view model.** `toMessageViews` maps the SDK's `UIMessage[]` to `ChatMessageView[]` through
+`toMessageView`, and every data part is read through `protocol.ts`'s guards, never a cast: a payload
+that fails its guard is ignored rather than rendered, and only the first valid part of each kind is
+taken. Text parts are concatenated verbatim — the answer is never trimmed, re-encoded or regexed.
+`degraded` parts merge across the whole message and dedupe in arrival order, because the route
+writes one before the text (the pipeline's own reason, `retrieval_failed`, and `screened`) and one
+after it (`uncited`, and the synthetic token), so a client must apply a late part rather than assume
+the part always precedes the text. A turn whose `activity` part carries a `protocol` this client
+does not know drops the activity, the refs, the citation report and the degraded list together and
+renders as text alone. An unknown degrade reason is not hidden: `degradeWording` renders it as
+`degraded: <reason>`, the raw token being the only honest thing to show before a wording exists.
+`state` is one discriminated value rather than a set of booleans, in precedence order `streaming`,
+`stopped`, `synthetic` (a `degraded` part named one of the three synthetic tokens), `degraded` (any
+other reason), `complete`.
+
+**Eviction, worded in three lines.** `report.evicted` carries three shapes in one list — dropped
+document/wiki ids, a `turns:<n>` marker and a `summary` marker — and `evictionWording` (in
+`components/chat/ActivityTrace.tsx`) renders them as three separate lines, because a trimmed turn
+and a dropped summary are not sources and one line for all three would misdescribe two of them:
+"3 sources did not fit: …", "2 earlier turns were trimmed", "the earlier conversation summary was
+dropped". The list is read from its end, since the assembler appends its markers last; reading the
+prefixes instead would mistake a document whose id happened to be `turns:5` for a marker.
+
+**The citation contract as the UI sees it.** `components/chat/CitationChips.tsx` builds its list
+from `EvidenceRef[]` plus the server's `CitationReport` and from nothing else. The answer text is
+never a prop and never parsed: a chip that came from a regex over prose would be the drift the
+numbering contract exists to prevent. A number the report marked `unknown` with no matching ref is
+a fabricated citation; it has no source to show, and it renders anyway — visually distinct
+(`border-danger/50 text-danger`) and named as broken (`E<n> — cited but not among the sources
+supplied`) — because dropping it would hide the one fact the validator went to the trouble of
+reporting. A number that is both cited and admitted resolves to its ref, one chip and not two. A
+turn with no citation report renders no chips at all: the refs are what the model *could* cite, not
+what it did.
+
+**The activity and degrade vocabulary.** The authority is `DEGRADED_REASONS` in
+`lib/ai/stream/protocol.ts` — the pipeline's eight, the route's three (`screened`, `uncited`,
+`retrieval_failed`) and the three synthetic tokens. The wording table in `ActivityTrace.tsx` is
+typed `Record<DegradedReason, string>`, so adding a reason to the server's vocabulary without
+wording it fails `tsc` rather than reaching a reader as an unexplained badge. `SYNTHETIC_STATE_REASONS`
+are filtered out of the list handed to the trace (`traceReasons` in `ChatMessage.tsx`), so each
+state is said once: the synthetic badge names it and the trace does not repeat it. The trace renders
+no provider name, key or raw error — it has no channel for one — and every number in it is a value
+the server measured, never a client clock reading.
+
+Two wordings a reader might expect in the view model are not there. `none` and `not recorded` are
+`formatTools` in `components/admin/AiObservabilityReport.tsx`, where `[]` (nothing was dispatched)
+and `null` (the row predates the pipeline) must not read alike, and `unmeasured` is that file's
+`formatCitations`, the rendering of `citations_valid: null` for a request that made no v2 citation
+decision. In the chat UI an empty tool list is `activitySummary`'s "no steps", not "none".
+
+**Feedback storage and its ownership rule.** `public.ai_message_feedback`
+(`20260919140000_ai_message_feedback.sql`) is one row per message per user: `value smallint check
+(value in (-1, 1))` and an optional `note`, RLS enabled with no policies and grants revoked from
+`anon` and `authenticated`, so only the `service_role` key reaches it. A second vote is a
+replacement, not a second row: `lib/ai/feedback/store.ts` upserts on `(message_id, user_id)` — the
+unique index `ai_message_feedback_message_user_idx` — and `POST /api/ai-chat/feedback` is its only
+writer. Ownership is never a client-supplied filter: the message id is resolved through the caller's
+own conversations before anything is written, and "no such message", "not yours" and "not an id" are
+the same 404, so a caller cannot probe another user's ids. The table is never pruned — it is small
+and it is the quality signal — and the observability store reads it through `feedbackSummary`.
+
+**The drawer and the memory panel.** `components/chat/ConversationDrawer.tsx` reads
+`GET /api/ai-chat/conversations` (the 30 newest, archived rows excluded) and loads one transcript
+from `GET …?id=<uuid>`. Its `DELETE …?id=<uuid>` **archives**: it sets `archived_at`, the transcript
+survives, every list read excludes it, and nothing can un-archive it — the port's patch mapping has
+a tested explicit-null branch, but no route reaches it, so there is no undo. That is why the guard
+against a mis-tap is an inline confirmation in the row rather than a "restore" button after the
+fact; an undo here would be a button that lies about what the route can do.
+`components/chat/MemoryPanel.tsx` reads `GET /api/ai-chat/memory`, which now reports `memoryEnabled`
+alongside `facts` and `cap` so a client can tell "memory is off" from "nothing stored yet" — both of
+which arrive as an empty `facts` array. The route deliberately does not consult `AI_MEMORY`: the
+switch stops extraction and injection, not transparency, so stored facts are returned either way and
+a user who hit the kill switch can still see and remove them. Its `DELETE ?id=<uuid>` is a **real**
+delete, unlike the conversations archive, and it takes exactly one id — the route and the
+`MemoryStore` behind it have no bulk shape, so a later reader should not add a "clear all"; the
+guard against a mis-tap is the inline confirmation in the row.
+
+**Accessibility.** The message container's `aria-live="polite"` with `aria-atomic="false"` lives in
+`components/chat/ChatWidget.tsx`, which is frozen and still to be rebuilt; it does not currently
+switch to `off` or `role="log"` when a turn completes, so that transition is part of the pending
+widget work rather than of the shipped components. Focus restoration is handled per panel, not by
+the primitive: Radix restores focus only to a `DialogTrigger`, and these panels are opened by
+controls outside themselves, so each captures `document.activeElement` in `onOpenAutoFocus` and
+returns it in `onCloseAutoFocus` (`SourcesPanel`, `ConversationDrawer`, `MemoryPanel`). Every
+`framer-motion` transition in `components/chat/` has a reduced-motion branch — `useReducedMotion()`
+selects `initial={false}`, so the final state is applied at once — and
+`components/chat/__tests__/a11y.test.tsx` drives each keyboard path with `user-event` keys alone and
+pins both branches.
+
+**Touch targets.** The drawer's archive control and the memory panel's delete control are `size-11`
+(44 px) below `sm` and `size-7` (28 px) at `sm` and up; only the hit area changes, the glyph keeps
+its `size-3.5`. The shared dialog close control in `components/ui/dialog.tsx` is a 16 px glyph
+(`h-4 w-4`) with `p-1`, so a 24 px hit area — the minimum of WCAG 2.2 SC 2.5.8 — with the offsets
+dropped to `3` so the padding grows the box outward around the same glyph position.
+`components/chat/__tests__/responsive.test.tsx` asserts both values, and jsdom reports no layout, so
+it asserts the Tailwind spacing tokens (4 px per unit) rather than geometry.
+
+**Migration and rollback.** `supabase/migrations/20260919140000_ai_message_feedback.sql` is
+committed and **not applied** to any database, and no test executes it: the migration tests read the
+file and assert its structure, not its effect, because CI has no Postgres. The manual verification
+SQL a human runs after applying it is in "Migration status" above — the columns query against
+`information_schema.columns` and the `pg_indexes` query for `ai_message_feedback_message_idx` and
+`ai_message_feedback_message_user_idx`. The rollback is `AI_PIPELINE=v1`, and it changes the
+pipeline and therefore which parts the UI receives: v1 sends no evidence part and no citations part.
+**The UI itself has no v1 switch and must not need one** — it renders text alone when the parts are
+absent, so a v1 deployment shows the answer, the activity trace and any degrade badges, with no
+chips and no sources.
+
+**Not covered yet.** The conversation drawer, the memory panel, the keyboard and screen-reader pass,
+the responsive/touch-target pass and the `memoryEnabled` signal on the memory route have all shipped
+and are committed. What has not is the rebuild of `components/chat/ChatWidget.tsx` itself: its
+wiring of the drawer and the panel, the message container's live-region transition, the regenerate
+keyboard path, and the composer's viewport placement all live inside that one file, which is frozen
+pending P1 — the repo owner's uncommitted work on it, which also introduces a new staged
+`lib/character-chrome.ts` that the widget imports, so no partial commit of it can leave the tree
+buildable. Nothing renders the drawer or the panel yet: they exist, they are tested and they are
+prop-driven, but the widget that would open them is the file that is frozen, so the feature is not
+reachable from the UI. This section documents the components as they ship, not a live surface.
 
 ---
 

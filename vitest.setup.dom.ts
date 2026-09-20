@@ -16,9 +16,17 @@ afterEach(() => {
 // Read by framer-motion's reduced-motion detection and by
 // lib/use-media-query.ts. Reporting "reduce" is the branch task 11 asserts, and
 // the safe default: motion off, content unchanged.
+//
+// The match is a substring test, not equality, because the two callers ask two
+// different questions: framer-motion asks the boolean form
+// ("(prefers-reduced-motion)" — verified in
+// node_modules/framer-motion/dist/es/utils/reduced-motion/index.mjs) while
+// lib/use-media-query.ts asks the feature form with a value. Matching only the
+// feature form left framer-motion on its animated branch, so a reduced-motion
+// assertion would have tested the wrong branch while looking green.
 window.matchMedia = (query: string): MediaQueryList =>
   ({
-    matches: query === "(prefers-reduced-motion: reduce)",
+    matches: query.includes("prefers-reduced-motion") && !query.includes("no-preference"),
     media: query,
     onchange: null,
     addListener: () => {},

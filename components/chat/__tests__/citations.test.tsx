@@ -1,7 +1,7 @@
 import * as React from "react"
 import { render, screen, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
-import { beforeAll, describe, expect, it, vi } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import type { UIMessage } from "ai"
 import { PARTS, PROTOCOL_VERSION } from "@/lib/ai/stream/protocol"
 import { toMessageView, type StreamViewContext } from "@/components/chat/useChatStream"
@@ -21,21 +21,6 @@ import { SourcesPanel } from "@/components/chat/SourcesPanel"
  */
 
 const IDLE: StreamViewContext = { streamingMessageId: null, stoppedMessageId: null }
-
-// vitest.setup.dom.ts stubs matchMedia for the canonical
-// "(prefers-reduced-motion: reduce)" query, but framer-motion's
-// useReducedMotion asks the boolean form "(prefers-reduced-motion)" — a query
-// the stub does not match, so the hook would report "no preference" and the
-// reduced branch would go untested. Answer framer-motion's form with the
-// stub's own reduce answer; every other query keeps the stub's behaviour.
-// (The stub's narrow match is a Task 1 bug: reported, not fixed here.)
-const reduceStub = window.matchMedia
-beforeAll(() => {
-  window.matchMedia = ((query: string) =>
-    query === "(prefers-reduced-motion)"
-      ? { ...reduceStub("(prefers-reduced-motion: reduce)"), media: query }
-      : reduceStub(query)) as typeof window.matchMedia
-})
 
 const RET: EvidenceRef = { n: 1, id: "ep-1", tag: "[RET]", label: "Episode 1" }
 const WIKI: EvidenceRef = { n: 2, id: "wiki:dcw:Shinichi", tag: "[WIKI]", label: "Shinichi Kudo" }

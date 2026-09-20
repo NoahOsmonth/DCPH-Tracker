@@ -523,6 +523,72 @@ Checked against the repository, not against the task reports:
 **Plan 6's final state:** `f9fbd7f`, `a968048`, `7e4f7dc`, `f9504ba`…`e0ce400` — 91 files /
 1,477 tests, `tsc` exit 0, lint 0 errors / 14 warnings, build green.
 
+### C37 — the browser acceptance pass, and what it found
+
+The unit suites pin the parts and the guards; they cannot see layout, hover, focus or a real
+response. So a real browser (the in-app browser, 1280×900 and 390×844) was driven over a
+**temporary, uncommitted harness** — `app/dev-preview/page.tsx` and its client sibling — which
+mounted the shipped components with hand-built data and was deleted afterwards. The harness is
+the point worth recording: it built AI SDK `UIMessage`s exactly as the route emits them and ran
+them through the real `toMessageViews`, so the browser exercised the parts→view-model mapping and
+the guards, not a lookalike renderer. An earlier draft that hand-built `ChatMessageView`s was
+discarded for exactly this reason — it rendered a trace for a turn whose `protocol` was `99`,
+which the real mapping discards, i.e. it would have "verified" behaviour the product does not have.
+
+**Verified in the browser, with the real components.** Observability (Plan 6 T3): the exact count
+beside the sampled row count with the `sampled` badge and its disclaimer, and the `complete` badge
+under the cap; a zero-row window rendering "No requests were logged in this window." as a state
+distinct from the unavailable card; buckets sorted descending with a null reason under `none`; a
+stage that never ran reading "no data" rather than `0 ms`; and the two null-vs-empty distinctions
+rendering as designed — `tools: []` as `none` against `tools: null` as `not recorded`, and
+`citations_valid: null` as `unmeasured`. Chat (Plan 5 T5–T7): chips built from `citations.cited`
+only (an admitted-but-uncited `E3` correctly has no chip), a fabricated `E7` rendering as a
+distinct broken chip, the trace's reader-facing tool verbs, its total being retrieve + assemble
+and **not** also adding `planMs` (the double-count `totalActivityMs` documents), the expanded
+stage table and plan-source line, and the eviction list rendering as three separate honest lines —
+`2 sources did not fit: entry:6, entry:5`, `4 earlier turns were trimmed`, `the earlier conversation
+summary was dropped` — which is C20's whole point. Also: the synthetic badge, the stopped note with
+no rating offered, typing dots with no copy button, an unknown `protocol` dropping the activity,
+evidence and citations parts so the turn renders as text alone, an unknown reason surfacing as
+`degraded: some_future_reason` rather than being hidden, a wholly malformed part set being ignored,
+the user turn aligned right, and the legacy shape unchanged. Interactions: a chip opens the inline
+panel with the highlight landing on the right ref (`aria-current="true"` on `E2`), the modal panel
+reports the fabricated `E9` in words, a vote POSTs `{messageId, value:1}` and lights the thumb, and
+a 500 rolls the thumb back and shows the fixed message with no raw failure text.
+
+**Findings.** Two, both minor, neither a Plan 5/6 regression:
+
+- **F1 (cosmetic, P3).** In the recent-requests table the `TOTAL` cell wraps — `1712 ms` breaks
+  onto two lines — because `TIME` carries `whitespace-nowrap` and the latency cells do not. The
+  fix is `whitespace-nowrap` on the latency cells in `RecentRow`.
+- **F2 (hardening, P3, pre-existing).** `POST /api/ai-chat` checks its provider configuration
+  (500) before the same-origin guard (403) and before auth (401), so an anonymous caller can learn
+  "Chat is not configured on this server" on a misconfigured deployment. `git show f58e6f6^` shows
+  the same order before the gateway rewire, so it is inherited, not introduced; on a configured
+  server an anonymous caller still gets a clean 401, and the message is deliberately non-secret.
+
+**Environment limits, recorded so the pass is not over-read.** The sandbox cannot reach Supabase
+(`ECONNREFUSED`), so no session exists: `/admin/ai` redirects anonymous callers to `/?auth=signin`
+(the gate working), and `/api/admin/ai-observability` answers 429 through the route's existing
+`failClosed: true` convention rather than the 401 an unreachable log would otherwise produce.
+Playwright's `locator.click()` times out on every element in this browser session — verified on a
+plain, unique, visible button — and a coordinate click did not land either, so interactions were
+driven by page-context `element.click()`, a real DOM click React handles. `cua.move` works for
+hover; `cua.keypress` wants `keys: [...]`, not a string. `<html>` carries `scroll-smooth`, so
+`window.scrollTo` animates and Playwright's auto-scroll never reports a stable element; scrolling
+instantly first is required before any action.
+
+**F3 — the P1 blocker's blast radius.** The frozen widget gates its own send path behind auth
+(`!authLoading && !user` renders "Member Access Only"), so the widget→route incompatibility behind
+precondition P1 — the frozen widget posts `{ message, history }` and concatenates raw response
+bytes, while the route now emits an SSE UI-message stream — is **not reachable by an anonymous
+visitor**: only a signed-in user can reach it. P1 is still real and still blocks Plan 5 T8–T11;
+this narrows who it can bite.
+
+**Close.** The harness was removed and the tree restored to its prior state: the ten in-flight
+paths still staged, `components/chat/ChatWidget.tsx`'s worktree still equal to its index, `tsc`
+exit 0, and the full suite green at 91 files / 1,477 tests.
+
 ## 6. Task index
 
 | # | Task | Files | Commit |

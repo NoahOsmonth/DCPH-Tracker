@@ -10,14 +10,17 @@
   All characters and relationships are always visible and un-gated.
 */
 
-import { useMemo, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 import dynamic from "next/dynamic"
 import { AnimatePresence, motion } from "framer-motion"
 import {
   CharacterDetailPanel,
   RelationshipLegend,
+  type SheetSnap,
 } from "@/components/characters/CharacterDetailPanel"
 import { useTheme } from "@/components/theme-provider"
+import { setCharacterChromeHidden } from "@/lib/character-chrome"
+import { useMediaQuery } from "@/lib/use-media-query"
 import { getRelationshipColor } from "@/components/characters/graph-theme"
 import { ChevronDown, Filter } from "lucide-react"
 import { cn } from "@/lib/utils"
@@ -64,9 +67,40 @@ export default function CharactersExplorer({
   const [selection, setSelection] = useState<Character | null>(null)
   const [filter, setFilter] = useState<RelationshipType | null>(null)
   const [legendOpen, setLegendOpen] = useState(false)
+  const [panelSnap, setPanelSnap] = useState<SheetSnap>("peek")
+
+  // Sync matchMedia — correct on the first client render, so selecting a
+  // character on a phone never flashes the desktop card.
+  const isMobile = useMediaQuery("(max-width: 767px)")
 
   const { theme } = useTheme()
   const isDark = theme === "dark"
+
+  /* Task 3 — hide chrome while a dossier is open on phones. Publishes to the
+     shared store consumed by the globally mounted ChatWidget; the cleanup also
+     covers navigating away from /characters with the sheet still open. */
+  const hideControls = isMobile && selection != null
+  useEffect(() => {
+    setCharacterChromeHidden(hideControls)
+    return () => setCharacterChromeHidden(false)
+  }, [hideControls])
+
+  // Height (vh) the mobile sheet reserves at the bottom of the viewport —
+  // feeds usableRect and the dock offset inside CharactersWeb.
+  const sheetInsetVh =
+    selection && isMobile ? (panelSnap === "peek" ? 30 : panelSnap === "half" ? 48 : 85) : 0
+
+  // A new selection remounts the sheet at peek — reset the snap DURING the
+  // selection render (React's adjust-state-during-render pattern) so the
+  // selection and the reset land in ONE commit. A post-render useEffect here
+  // caused a second full CharactersWeb render on every tap (measured tap
+  // spike: 137ms longtask / 166ms worst rAF gap on dev).
+  const selectionId = selection?.id ?? null
+  const [lastSelectionId, setLastSelectionId] = useState<string | null>(null)
+  if (selectionId !== lastSelectionId) {
+    setLastSelectionId(selectionId)
+    setPanelSnap("peek")
+  }
 
   const threadsFor = (characterId: string): Relationship[] => {
     const all = relationships.filter(
@@ -143,6 +177,8 @@ export default function CharactersExplorer({
         selectedCharacterId={selection?.id}
         activeFilter={filter}
         topLeftSlot={filterControls}
+        hideControls={hideControls}
+        sheetInsetVh={sheetInsetVh}
         theme={theme}
         className="h-full w-full rounded-none border-none shadow-none"
       />
@@ -157,6 +193,7 @@ export default function CharactersExplorer({
               character={selection}
               relationships={panelRelationships}
               onClose={() => setSelection(null)}
+              onSnapChange={setPanelSnap}
             />
           </div>
         )}

@@ -516,6 +516,25 @@ describe("POST /api/ai-chat through the agentic pipeline", () => {
     expect(persistence.afterTurn).not.toHaveBeenCalled()
   })
 
+  it("reports a synthetic state instead of `uncited` when the answer never arrived", async () => {
+    // Evidence was supplied, so `validateCitations` sees `requireCitation: true`
+    // against an empty accumulator and reports `uncited`. That verdict is about
+    // an answer, and this turn has none: the reader gets the rate-limited
+    // sentence and that state alone, never a second badge for a citation that
+    // was never possible.
+    runPipeline.mockResolvedValue(assembledResult(scored(doc(1))))
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("busy", { status: 429 })))
+    const { POST } = await import("@/app/api/ai-chat/route")
+
+    const { message } = await readStream(await POST(post({ message: USER_MESSAGE })))
+    await runAfterTasks()
+
+    expect(validateCitations.mock.calls[0]?.[0]).toMatchObject({ text: "", requireCitation: true })
+    const degraded = dataPart(message, PARTS.degraded)
+    if (!isDegradedPart(degraded)) throw new Error("no degraded part")
+    expect(degraded.reasons).toEqual(["rate_limited"])
+  })
+
   it("assembles the memory block and the summary through the pipeline, not the prompt builder", async () => {
     persistence.window.mockResolvedValue({
       summary: "They discussed episode 5.",

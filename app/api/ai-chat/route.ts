@@ -212,12 +212,18 @@ function preAnswerDegradedReasons(input: {
  * verdict on the finished text, and the synthetic token names why the stream
  * ended. Both are written as a `degraded` part after the text, so the client
  * must apply a late part to the message it just rendered (Task 4).
+ *
+ * A synthetic token displaces `uncited` rather than joining it. `uncited` means
+ * "evidence was supplied and the answer cited none of it", which is a fact about
+ * an answer; when the stream ended in one of our own sentences there is no model
+ * answer to judge, and `validateCitations` reports `uncited` only because it was
+ * handed the empty accumulator. Reporting both would badge a rate-limited turn
+ * as an uncited one. The log is unaffected: its `outcome` column already names
+ * the synthetic state, so nothing is lost by not repeating it here.
  */
 function lateDegradedReasons(input: { uncited: boolean; synthetic: string | null }): string[] {
-  const reasons: string[] = []
-  if (input.uncited) reasons.push(UNCITED_REASON)
-  if (input.synthetic !== null) reasons.push(input.synthetic)
-  return reasons
+  if (input.synthetic !== null) return [input.synthetic]
+  return input.uncited ? [UNCITED_REASON] : []
 }
 
 export async function POST(request: Request) {

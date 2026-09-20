@@ -3,17 +3,17 @@
 // The machine-facing read of the request log. The operator page reads the store
 // directly (D1); this route exists for a cron or other tooling that has no
 // session. Two ways in, one shape out: an admin session, or the constant-time
-// `Authorization: Bearer <CRON_SECRET>` check `app/api/sync/route.ts` uses. The
-// secret grants no wider a query -- the same window is parsed, the same store
-// answers, and the same body comes back.
+// `Authorization: Bearer <CRON_SECRET>` check in lib/cron-auth.ts (the one copy
+// in the repo). The secret grants no wider a query -- the same window is parsed,
+// the same store answers, and the same body comes back.
 //
 // The window is validated here and bounded by the store. The caller's edges are
 // passed through unchanged; the store clamps them and reports the window it
 // actually read, so this route carries no second copy of the bound.
-import crypto from "crypto"
 import { NextResponse, type NextRequest } from "next/server"
 
 import { fail, handleApiError } from "@/lib/api-utils"
+import { cronSecret, headerMatchesSecret } from "@/lib/cron-auth"
 import { logger } from "@/lib/logger"
 import { isSameOrigin } from "@/lib/origin-check"
 import { authRateLimitKey } from "@/lib/rate-limit"
@@ -34,22 +34,6 @@ const MISSING_SERVICE_ROLE = "Missing Supabase service role env vars"
 
 /** An unparseable edge is refused rather than silently defaulted. */
 const BAD_WINDOW = "`since` and `until` must be ISO timestamps or epoch milliseconds."
-
-/**
- * Constant-time comparison of `Authorization: Bearer <secret>` against the
- * configured CRON_SECRET, byte for byte as `app/api/sync/route.ts` does it:
- * fixed-width SHA-256 digests so the secret's length never leaks, and never a
- * query-string read (constraint 3).
- */
-function headerMatchesSecret(
-  authorization: string | null,
-  secret: string | undefined
-): boolean {
-  if (!secret || !authorization) return false
-  const a = crypto.createHash("sha256").update(authorization).digest()
-  const b = crypto.createHash("sha256").update(`Bearer ${secret}`).digest()
-  return crypto.timingSafeEqual(a, b)
-}
 
 interface Edge {
   ok: boolean
@@ -89,7 +73,7 @@ export async function GET(request: NextRequest) {
   // whether the session is consulted; both paths reach the same store read.
   const isCron = headerMatchesSecret(
     request.headers.get("authorization"),
-    process.env.CRON_SECRET
+    cronSecret()
   )
   if (!isCron) {
     const supabase = await createClient()

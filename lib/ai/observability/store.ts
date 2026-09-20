@@ -72,6 +72,50 @@ export const PERCENTILE_SAMPLE_CAP = 1000
  */
 export const NULL_BUCKET = "none"
 
+/**
+ * The default retention age: ninety days. The log is the operator's window into
+ * recent behaviour, not an archive; a quarter is long enough to see a slow
+ * regression and short enough that the table stays a few million rows on a free
+ * tier. `AI_LOG_RETENTION_DAYS` overrides it per deployment.
+ */
+export const DEFAULT_RETENTION_DAYS = 90
+
+/**
+ * The ids one delete batch names, and the size of the read that fills it.
+ * PostgREST carries an `.in()` list in the query string, so 200 UUIDs (~7.4 kB)
+ * stay inside the proxy URL limit while keeping one statement a short
+ * transaction. Read and delete are the same size, so a batch is one read and one
+ * delete with no partial batch left behind.
+ */
+export const RETENTION_BATCH_ROWS = 200
+
+/**
+ * The batches one invocation may run. Twenty batches bound a single sweep to
+ * 4,000 rows: enough that a daily cron drains ordinary growth, small enough that
+ * one request cannot hold a connection open deleting an unbounded backlog. When
+ * the cap is reached the report says `exhausted: false`, so a partial sweep is
+ * never presented as a complete one.
+ */
+export const RETENTION_MAX_BATCHES = 20
+
+/**
+ * The configured retention age, in days. An absent, unparseable, non-integer,
+ * zero or negative value falls back to DEFAULT_RETENTION_DAYS — never to zero,
+ * because a zero cutoff would delete the whole table. Only a plain positive
+ * integer string is accepted; `""`, `"1.5"`, `"90d"` and `"-1"` are all refused,
+ * and a value too large to be a safe integer is refused too rather than becoming
+ * a cutoff outside the range `Date` can represent.
+ */
+export function retentionDays(): number {
+  const raw = process.env.AI_LOG_RETENTION_DAYS
+  if (raw === undefined) return DEFAULT_RETENTION_DAYS
+  const text = raw.trim()
+  if (!/^\d+$/.test(text)) return DEFAULT_RETENTION_DAYS
+  const parsed = Number(text)
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) return DEFAULT_RETENTION_DAYS
+  return parsed
+}
+
 /** One row of `ai_request_log`, as the read side sees it. Times are epoch ms. */
 export interface RequestLogRow {
   id: string
@@ -113,6 +157,45 @@ export interface FeedbackCountQuery extends RequestWindow {
   hasNote?: boolean
 }
 
+/**
+ * The oldest expired rows, bounded. `beforeMs` is exclusive — a row written
+ * exactly on the cutoff survives — so the sweep and a re-run agree about which
+ * rows are eligible. Unwindowed by design: the cutoff is the entire predicate,
+ * and `limit` is the only bound (F2 — a windowed read would clamp the cutoff).
+ */
+export interface ExpiredIdQuery {
+  beforeMs: number
+  limit: number
+}
+
+export interface RetentionInput {
+  /** Absent or `true` counts only; `false` performs the delete. */
+  dryRun?: boolean
+}
+
+/**
+ * What one sweep did. `exhausted` is the field that keeps a partial sweep from
+ * being read as a complete one: `false` means the run stopped at
+ * RETENTION_MAX_BATCHES (or, in a dry run, filled its one batch) with expired
+ * rows still present.
+ */
+export interface RetentionReport {
+  /** The age actually used, after the env fallback. */
+  retentionDays: number
+  /** Rows written before this instant are expired. Never clamped by MAX_WINDOW_MS. */
+  cutoffMs: number
+  dryRun: boolean
+  /**
+   * Rows deleted, or — in a dry run — the rows its one bounded batch found and
+   * a real run would remove first.
+   */
+  removed: number
+  /** Read/delete batches run. */
+  batches: number
+  /** False when expired rows remain because a bound was reached. */
+  exhausted: boolean
+}
+
 export interface ObservabilityPort {
   /** Exact row count in the window: a head count, no rows transferred. */
   countRequests(window: RequestWindow): Promise<number>
@@ -120,6 +203,10 @@ export interface ObservabilityPort {
   listRequests(query: RequestListQuery): Promise<RequestLogRow[]>
   /** Exact vote count in the window, optionally narrowed to one value or to noted votes. */
   countFeedback(query: FeedbackCountQuery): Promise<number>
+  /** The oldest ids older than the cutoff, ascending, bounded by `limit`. */
+  listExpiredIds(query: ExpiredIdQuery): Promise<string[]>
+  /** Deletes exactly these rows. A no-op for an empty list. */
+  deleteRequests(ids: string[]): Promise<void>
 }
 
 export interface WindowInput {
@@ -182,6 +269,8 @@ export interface ObservabilityStore {
   summary(input?: WindowInput): Promise<WindowSummary>
   recent(input?: { limit?: number }): Promise<RequestLogRow[]>
   feedbackSummary(input?: WindowInput): Promise<FeedbackSummary>
+  /** Deletes expired rows in bounded batches; dry by default. */
+  retention(input?: RetentionInput): Promise<RetentionReport>
 }
 
 export interface ObservabilityStoreDeps {
@@ -352,6 +441,53 @@ export function createObservabilityStore(deps: ObservabilityStoreDeps): Observab
       ])
       return { sinceMs, untilMs, up, down, noted }
     },
+
+    async retention(input = {}) {
+      const dryRun = input.dryRun !== false
+      const days = retentionDays()
+      // Deliberately NOT resolveWindow: it clamps every window to MAX_WINDOW_MS
+      // (30 days), so a 90-day cutoff passed through it would silently become 30
+      // and the sweep would look complete while leaving most of the expired
+      // table behind (F2). The cutoff is its own arithmetic; the batch caps
+      // below are what bound the run.
+      const cutoffMs = clock() - days * MS_PER_DAY
+
+      let removed = 0
+      let batches = 0
+      let exhausted = false
+
+      while (batches < RETENTION_MAX_BATCHES) {
+        const ids = await port.listExpiredIds({
+          beforeMs: cutoffMs,
+          limit: RETENTION_BATCH_ROWS,
+        })
+        // Nothing older than the cutoff remains: the sweep reached the end.
+        if (ids.length === 0) {
+          exhausted = true
+          break
+        }
+        // A dry run cannot advance -- the next read would return the same ids --
+        // so it stops after one bounded batch. A full batch means more expired
+        // rows exist, which `exhausted: false` reports rather than hiding.
+        if (dryRun) {
+          removed = ids.length
+          batches = 1
+          exhausted = ids.length < RETENTION_BATCH_ROWS
+          break
+        }
+        await port.deleteRequests(ids)
+        removed += ids.length
+        batches += 1
+        // A short batch is the last one; a full batch may be followed by more,
+        // and the loop's own cap decides when to stop.
+        if (ids.length < RETENTION_BATCH_ROWS) {
+          exhausted = true
+          break
+        }
+      }
+
+      return { retentionDays: days, cutoffMs, dryRun, removed, batches, exhausted }
+    },
   }
 }
 
@@ -378,14 +514,27 @@ export interface ObservabilityQuery extends PromiseLike<ObservabilityResult> {
   limit(count: number): ObservabilityQuery
 }
 
+/**
+ * The delete half of the builder. Deliberately narrow: the retention sweep
+ * deletes by primary key and nothing else, so this exposes only the `.in()` it
+ * uses rather than the whole filter surface the reads carry.
+ */
+export interface ObservabilityDeleteQuery extends PromiseLike<ObservabilityResult> {
+  in(column: string, values: string[]): ObservabilityDeleteQuery
+}
+
 export interface ObservabilityClient {
   from(table: string): {
     select(columns: string, options?: { count: "exact"; head: boolean }): ObservabilityQuery
+    delete(): ObservabilityDeleteQuery
   }
 }
 
 const LOG_TABLE = "ai_request_log"
 const FEEDBACK_TABLE = "ai_message_feedback"
+
+/** Milliseconds in a day, for the retention cutoff. */
+const MS_PER_DAY = 24 * 60 * 60 * 1000
 
 /**
  * Every column `recent` renders. `attempts` is deliberately absent: it is the
@@ -500,6 +649,28 @@ export function createSupabaseObservabilityPort(
       const { count, error } = await builder
       if (error) fail("countFeedback", error.message)
       return count ?? 0
+    },
+
+    async listExpiredIds(query) {
+      // Oldest first, so the sweep always removes the rows closest to falling
+      // off the end. Unwindowed by design: the cutoff is the whole predicate and
+      // `limit` is the only bound (F2).
+      const { data, error } = await client
+        .from(LOG_TABLE)
+        .select("id")
+        .lt("created_at", toIso(query.beforeMs))
+        .order("created_at", { ascending: true })
+        .limit(query.limit)
+      if (error) fail("listExpiredIds", error.message)
+      return (data ?? []).map((row) => String(row.id))
+    },
+
+    async deleteRequests(ids) {
+      // An empty `.in()` would be an invalid predicate; nothing to delete is not
+      // a query, so it costs no round trip.
+      if (ids.length === 0) return
+      const { error } = await client.from(LOG_TABLE).delete().in("id", ids)
+      if (error) fail("deleteRequests", error.message)
     },
   }
 }

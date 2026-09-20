@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from "next/server"
-import crypto from "crypto"
 import { createClient } from "@/utils/supabase/server"
 import { createAdminClient } from "@/utils/supabase/admin"
 import { handleApiError } from "@/lib/api-utils"
+import { cronSecret, headerMatchesSecret } from "@/lib/cron-auth"
 import {
   getAllEpisodes,
   getAnimeFull,
@@ -26,22 +26,6 @@ type ContentInsert = Database["public"]["Tables"]["content_entries"]["Insert"]
 
 /** Either the cookie-bound server client or the service-role admin client. */
 type SyncClient = Awaited<ReturnType<typeof createClient>>
-
-/**
- * Constant-time comparison of `Authorization: Bearer <secret>` against the
- * configured CRON_SECRET. Never accepts the secret via query string — that
- * would leak it into Vercel/access logs.
- */
-function headerMatchesSecret(
-  authorization: string | null,
-  secret: string | undefined
-): boolean {
-  if (!secret || !authorization) return false
-  // Compare fixed-width digests so the secret's length never leaks.
-  const a = crypto.createHash("sha256").update(authorization).digest()
-  const b = crypto.createHash("sha256").update(`Bearer ${secret}`).digest()
-  return crypto.timingSafeEqual(a, b)
-}
 
 interface SyncResult {
   type: "episodes" | "franchise" | "airing"
@@ -94,8 +78,7 @@ export async function POST(request: NextRequest) {
     const supabase = await createClient()
 
     // 0. Authorize: cron secret (header-only, timing-safe) OR admin user session.
-    const cronSecret = process.env.CRON_SECRET
-    const isCron = headerMatchesSecret(request.headers.get("authorization"), cronSecret)
+    const isCron = headerMatchesSecret(request.headers.get("authorization"), cronSecret())
 
     if (!isCron) {
       const { data: { user } } = await supabase.auth.getUser()
@@ -610,8 +593,20 @@ async function syncAiring(
 /**
  * GET /api/sync
  * Returns current sync status (how many entries exist by type)
+ *
+ * Vercel Cron also calls this path — with GET, and `Authorization: Bearer
+ * $CRON_SECRET` when that env var is set. The status body below takes no request
+ * argument and ignores `?mode=`, so a cron call is delegated to POST, which owns
+ * the whole sync implementation. A request without the secret falls through to
+ * the byte-identical status response.
  */
-export async function GET() {
+export async function GET(request: NextRequest) {
+  // A cron sends no Origin, so POST's `isSameOrigin` passes; and POST reads its
+  // params from `request.nextUrl.searchParams`, which a GET request has too.
+  if (headerMatchesSecret(request.headers.get("authorization"), cronSecret())) {
+    return POST(request)
+  }
+
   try {
     const supabase = await createClient()
 

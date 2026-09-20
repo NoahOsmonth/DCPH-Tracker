@@ -10,18 +10,23 @@
  * reads a real timer either.
  */
 
-import { describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it } from "vitest"
 import {
+  DEFAULT_RETENTION_DAYS,
   DEFAULT_WINDOW_MS,
   MAX_WINDOW_MS,
   NULL_BUCKET,
   PERCENTILE_SAMPLE_CAP,
   RECENT_ROW_LIMIT,
+  RETENTION_BATCH_ROWS,
+  RETENTION_MAX_BATCHES,
   createObservabilityStore,
   createSupabaseObservabilityPort,
   percentile,
+  retentionDays,
   type FeedbackCountQuery,
   type ObservabilityClient,
+  type ObservabilityDeleteQuery,
   type ObservabilityPort,
   type ObservabilityQuery,
   type ObservabilityResult,
@@ -31,11 +36,19 @@ import {
 const NOW_ISO = "2026-09-19T12:00:00.000Z"
 const NOW = Date.parse(NOW_ISO)
 const HOUR = 60 * 60 * 1000
+const DAY = 24 * HOUR
 const USER_ID = "11111111-1111-4111-8111-111111111111"
 const ROW_ID = "99999999-9999-4999-8999-999999999999"
 
 const LOG_TABLE = "ai_request_log"
 const FEEDBACK_TABLE = "ai_message_feedback"
+
+const originalRetentionDays = process.env.AI_LOG_RETENTION_DAYS
+
+afterEach(() => {
+  if (originalRetentionDays === undefined) delete process.env.AI_LOG_RETENTION_DAYS
+  else process.env.AI_LOG_RETENTION_DAYS = originalRetentionDays
+})
 
 /** The stored row `listRequests` reads back, with both nullable fields null. */
 const LOG_ROW: Record<string, unknown> = {
@@ -150,6 +163,23 @@ function createRecordingClient(script: ClientScript = {}): {
     return chain
   }
 
+  /** The delete chain, recording the `in()` predicate the sweep builds. */
+  function deleteQuery(table: string): ObservabilityDeleteQuery {
+    const chain: ObservabilityDeleteQuery = {
+      then(onFulfilled, onRejected) {
+        const reply: ObservabilityResult = script.error
+          ? { data: null, error: script.error }
+          : { data: null, error: null }
+        return settle(reply).then(onFulfilled, onRejected)
+      },
+      in(column, values) {
+        record(table, "in", [column, values])
+        return chain
+      },
+    }
+    return chain
+  }
+
   const client: ObservabilityClient = {
     from(table) {
       return {
@@ -158,6 +188,10 @@ function createRecordingClient(script: ClientScript = {}): {
           // conditionally keeps the assertions honest about which read ran.
           record(table, "select", options === undefined ? [columns] : [columns, options])
           return query(table)
+        },
+        delete() {
+          record(table, "delete", [])
+          return deleteQuery(table)
         },
       }
     },
@@ -297,6 +331,80 @@ describe("createSupabaseObservabilityPort countFeedback", () => {
   })
 })
 
+describe("createSupabaseObservabilityPort listExpiredIds", () => {
+  it("reads the oldest expired ids, unbounded by any window but the limit", async () => {
+    const { client, calls } = createRecordingClient({
+      rows: [{ id: ROW_ID }, { id: "other-id" }],
+    })
+
+    await expect(
+      createSupabaseObservabilityPort(client).listExpiredIds({
+        beforeMs: NOW - 90 * 24 * HOUR,
+        limit: RETENTION_BATCH_ROWS,
+      })
+    ).resolves.toEqual([ROW_ID, "other-id"])
+
+    // Ascending, so the sweep takes the rows closest to falling off the end,
+    // and a bare `lt` predicate: no `gte` bounds the read to a window (F2).
+    expect(calls).toEqual([
+      { table: LOG_TABLE, method: "select", args: ["id"] },
+      {
+        table: LOG_TABLE,
+        method: "lt",
+        args: ["created_at", new Date(NOW - 90 * 24 * HOUR).toISOString()],
+      },
+      { table: LOG_TABLE, method: "order", args: ["created_at", { ascending: true }] },
+      { table: LOG_TABLE, method: "limit", args: [RETENTION_BATCH_ROWS] },
+    ])
+  })
+
+  it("answers an empty table with no ids", async () => {
+    const { client } = createRecordingClient({ rows: [] })
+
+    await expect(
+      createSupabaseObservabilityPort(client).listExpiredIds({ beforeMs: NOW, limit: 10 })
+    ).resolves.toEqual([])
+  })
+
+  it("rejects with the database's message and the method that failed", async () => {
+    const { client } = createRecordingClient({ error: { message: "relation does not exist" } })
+
+    await expect(
+      createSupabaseObservabilityPort(client).listExpiredIds({ beforeMs: NOW, limit: 10 })
+    ).rejects.toThrow("[ai-observability] listExpiredIds: relation does not exist")
+  })
+})
+
+describe("createSupabaseObservabilityPort deleteRequests", () => {
+  it("deletes exactly the given ids", async () => {
+    const { client, calls } = createRecordingClient({})
+
+    await createSupabaseObservabilityPort(client).deleteRequests([ROW_ID, "other-id"])
+
+    expect(calls).toEqual([
+      { table: LOG_TABLE, method: "delete", args: [] },
+      { table: LOG_TABLE, method: "in", args: ["id", [ROW_ID, "other-id"]] },
+    ])
+  })
+
+  it("issues no query for an empty id list", async () => {
+    const { client, calls } = createRecordingClient({})
+
+    // An empty `.in()` is an invalid predicate; nothing to delete is not a query.
+    await createSupabaseObservabilityPort(client).deleteRequests([])
+
+    expect(calls).toEqual([])
+  })
+
+  it("rejects with the database's message and the method that failed", async () => {
+    const { client } = createRecordingClient({ error: { message: "permission denied" } })
+
+    await expect(
+      createSupabaseObservabilityPort(client).deleteRequests([ROW_ID])
+    ).rejects.toThrow("[ai-observability] deleteRequests: permission denied")
+  })
+})
+
 interface RecordedPortCall {
   method: string
   args: unknown[]
@@ -307,6 +415,11 @@ interface PortScript {
   rows?: RequestLogRow[]
   /** A per-query answer, so the three feedback counts can differ. */
   feedback?: number | ((query: FeedbackCountQuery) => number)
+  /**
+   * Successive `listExpiredIds` answers. The sweep is expected to stop on a
+   * short or empty batch, so a script that never runs short pins the run cap.
+   */
+  expired?: string[][]
   /** The one method that rejects, as a dropped connection would. */
   reject?: string
 }
@@ -316,6 +429,7 @@ function createFakePort(script: PortScript = {}): {
   calls: RecordedPortCall[]
 } {
   const calls: RecordedPortCall[] = []
+  let expiredReads = 0
 
   const port: ObservabilityPort = {
     async countRequests(window) {
@@ -333,6 +447,15 @@ function createFakePort(script: PortScript = {}): {
       if (script.reject === "countFeedback") throw new Error("countFeedback unavailable")
       if (typeof script.feedback === "function") return script.feedback(query)
       return script.feedback ?? 0
+    },
+    async listExpiredIds(query) {
+      calls.push({ method: "listExpiredIds", args: [query] })
+      if (script.reject === "listExpiredIds") throw new Error("listExpiredIds unavailable")
+      return script.expired?.[expiredReads++] ?? []
+    },
+    async deleteRequests(ids) {
+      calls.push({ method: "deleteRequests", args: [ids] })
+      if (script.reject === "deleteRequests") throw new Error("deleteRequests unavailable")
     },
   }
 
@@ -628,6 +751,174 @@ describe("createObservabilityStore feedbackSummary", () => {
     })
 
     expect(calls).toEqual([])
+  })
+})
+
+describe("retentionDays", () => {
+  it("defaults to ninety days when the variable is absent", () => {
+    delete process.env.AI_LOG_RETENTION_DAYS
+
+    expect(retentionDays()).toBe(DEFAULT_RETENTION_DAYS)
+    expect(DEFAULT_RETENTION_DAYS).toBe(90)
+  })
+
+  it("parses a positive integer and trims surrounding space", () => {
+    process.env.AI_LOG_RETENTION_DAYS = "30"
+    expect(retentionDays()).toBe(30)
+
+    process.env.AI_LOG_RETENTION_DAYS = " 45 "
+    expect(retentionDays()).toBe(45)
+  })
+
+  it("falls back to the default for zero, negative, fractional and unparseable values", () => {
+    // Never to zero: a zero-day cutoff would delete the whole table.
+    for (const raw of ["0", "-1", "1.5", "90d", "", "  ", "abc", "NaN", "Infinity"]) {
+      process.env.AI_LOG_RETENTION_DAYS = raw
+      expect(retentionDays()).toBe(DEFAULT_RETENTION_DAYS)
+    }
+  })
+
+  it("falls back for a value too large to be a safe integer", () => {
+    process.env.AI_LOG_RETENTION_DAYS = "99999999999999999999"
+    expect(retentionDays()).toBe(DEFAULT_RETENTION_DAYS)
+  })
+})
+
+describe("createObservabilityStore retention", () => {
+  it("defaults to a dry run: one bounded read and no delete", async () => {
+    const ids = Array.from({ length: RETENTION_BATCH_ROWS }, (_, index) => `id-${index}`)
+    const { port, calls } = createFakePort({ expired: [ids] })
+    const store = createObservabilityStore({ port, now: () => NOW })
+
+    const report = await store.retention()
+
+    expect(report.dryRun).toBe(true)
+    expect(report.removed).toBe(RETENTION_BATCH_ROWS)
+    expect(report.batches).toBe(1)
+    // A full batch means more expired rows exist; the sweep is not complete.
+    expect(report.exhausted).toBe(false)
+    expect(calls.map((call) => call.method)).toEqual(["listExpiredIds"])
+    expect(calls[0]?.args).toEqual([
+      { beforeMs: NOW - DEFAULT_RETENTION_DAYS * DAY, limit: RETENTION_BATCH_ROWS },
+    ])
+  })
+
+  it("treats an explicit dryRun: true as a dry run too", async () => {
+    const { port, calls } = createFakePort({ expired: [["a", "b"]] })
+    const store = createObservabilityStore({ port, now: () => NOW })
+
+    const report = await store.retention({ dryRun: true })
+
+    expect(report.dryRun).toBe(true)
+    expect(report.removed).toBe(2)
+    expect(calls.map((call) => call.method)).toEqual(["listExpiredIds"])
+  })
+
+  it("reports a short dry-run batch as exhausted", async () => {
+    const { port } = createFakePort({ expired: [["only-one"]] })
+    const store = createObservabilityStore({ port, now: () => NOW })
+
+    const report = await store.retention()
+
+    expect(report.removed).toBe(1)
+    expect(report.exhausted).toBe(true)
+  })
+
+  it("keeps the retention cutoff unwindowed: the full age, never MAX_WINDOW_MS (F2)", async () => {
+    const { port, calls } = createFakePort({ expired: [[]] })
+    const store = createObservabilityStore({ port, now: () => NOW })
+
+    const report = await store.retention({ dryRun: false })
+
+    // The failure this pins: a 90-day cutoff routed through resolveWindow would
+    // arrive as NOW - MAX_WINDOW_MS (30 days), so the sweep would look complete
+    // while leaving most of the expired table behind. `DEFAULT_RETENTION_DAYS`
+    // days must be strictly wider than the read side's maximum window for this
+    // assertion to mean anything.
+    expect(DEFAULT_RETENTION_DAYS * DAY).toBeGreaterThan(MAX_WINDOW_MS)
+    expect(calls[0]?.args).toEqual([
+      { beforeMs: NOW - DEFAULT_RETENTION_DAYS * DAY, limit: RETENTION_BATCH_ROWS },
+    ])
+    expect(report.cutoffMs).toBe(NOW - DEFAULT_RETENTION_DAYS * DAY)
+  })
+
+  it("deletes batch after batch in a real run and stops at the first short batch", async () => {
+    const full = Array.from({ length: RETENTION_BATCH_ROWS }, (_, index) => `full-${index}`)
+    const partial = ["last-1", "last-2"]
+    const { port, calls } = createFakePort({ expired: [full, partial] })
+    const store = createObservabilityStore({ port, now: () => NOW })
+
+    const report = await store.retention({ dryRun: false })
+
+    expect(report).toEqual({
+      retentionDays: DEFAULT_RETENTION_DAYS,
+      cutoffMs: NOW - DEFAULT_RETENTION_DAYS * DAY,
+      dryRun: false,
+      removed: RETENTION_BATCH_ROWS + 2,
+      batches: 2,
+      exhausted: true,
+    })
+    expect(calls.map((call) => call.method)).toEqual([
+      "listExpiredIds",
+      "deleteRequests",
+      "listExpiredIds",
+      "deleteRequests",
+    ])
+    expect(calls[1]?.args).toEqual([full])
+    expect(calls[3]?.args).toEqual([partial])
+  })
+
+  it("stops at the run's batch cap and reports the sweep as not exhausted", async () => {
+    const full = Array.from({ length: RETENTION_BATCH_ROWS }, (_, index) => `full-${index}`)
+    // Never runs short: only the run cap can stop the loop.
+    const expired = Array.from({ length: RETENTION_MAX_BATCHES + 5 }, () => full)
+    const { port, calls } = createFakePort({ expired })
+    const store = createObservabilityStore({ port, now: () => NOW })
+
+    const report = await store.retention({ dryRun: false })
+
+    expect(report.batches).toBe(RETENTION_MAX_BATCHES)
+    expect(report.removed).toBe(RETENTION_MAX_BATCHES * RETENTION_BATCH_ROWS)
+    // The field that keeps a partial sweep from being read as a complete one.
+    expect(report.exhausted).toBe(false)
+    expect(calls.filter((call) => call.method === "deleteRequests")).toHaveLength(
+      RETENTION_MAX_BATCHES
+    )
+  })
+
+  it("reports an empty table as exhausted with nothing removed", async () => {
+    const { port, calls } = createFakePort({ expired: [[]] })
+    const store = createObservabilityStore({ port, now: () => NOW })
+
+    const report = await store.retention({ dryRun: false })
+
+    expect(report).toEqual({
+      retentionDays: DEFAULT_RETENTION_DAYS,
+      cutoffMs: NOW - DEFAULT_RETENTION_DAYS * DAY,
+      dryRun: false,
+      removed: 0,
+      batches: 0,
+      exhausted: true,
+    })
+    expect(calls.map((call) => call.method)).toEqual(["listExpiredIds"])
+  })
+
+  it("uses the configured age for the cutoff", async () => {
+    process.env.AI_LOG_RETENTION_DAYS = "30"
+    const { port, calls } = createFakePort({ expired: [[]] })
+    const store = createObservabilityStore({ port, now: () => NOW })
+
+    const report = await store.retention({ dryRun: false })
+
+    expect(report.retentionDays).toBe(30)
+    expect(calls[0]?.args).toEqual([{ beforeMs: NOW - 30 * DAY, limit: RETENTION_BATCH_ROWS }])
+  })
+
+  it("propagates the port's failure unchanged", async () => {
+    const { port } = createFakePort({ reject: "listExpiredIds" })
+    const store = createObservabilityStore({ port, now: () => NOW })
+
+    await expect(store.retention({ dryRun: false })).rejects.toThrow("listExpiredIds unavailable")
   })
 })
 

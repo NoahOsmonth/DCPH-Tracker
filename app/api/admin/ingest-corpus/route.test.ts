@@ -46,6 +46,13 @@ function post(query = "", headers: Record<string, string> = {}) {
   })
 }
 
+function get(query = "", headers: Record<string, string> = {}) {
+  return new Request(`http://localhost/api/admin/ingest-corpus${query}`, {
+    method: "GET",
+    headers,
+  })
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
   // ADMIN_TASK_SECRET takes precedence in the route, so a stray real value
@@ -161,5 +168,74 @@ describe("POST /api/admin/ingest-corpus", () => {
   it("declares the 300s ceiling the collection walk needs", async () => {
     const { maxDuration } = await import("@/app/api/admin/ingest-corpus/route")
     expect(maxDuration).toBe(300)
+  })
+})
+
+describe("GET /api/admin/ingest-corpus", () => {
+  it("rejects a request without the Bearer secret before touching the database", async () => {
+    const { GET } = await import("@/app/api/admin/ingest-corpus/route")
+
+    const response = await GET(get())
+    expect(response.status).toBe(401)
+    expect(await response.json()).toEqual({ error: "unauthorized" })
+    expect(createAdminClient).not.toHaveBeenCalled()
+    expect(collectCorpus).not.toHaveBeenCalled()
+    expect(ingestCorpus).not.toHaveBeenCalled()
+  })
+
+  it("rejects the POST header and a wrong Bearer secret", async () => {
+    const { GET } = await import("@/app/api/admin/ingest-corpus/route")
+
+    // The GET door is the cron's, so the x-admin-secret POST uses must not open
+    // it, and neither must a wrong value.
+    expect((await GET(get("", { "x-admin-secret": SECRET }))).status).toBe(401)
+    expect((await GET(get("", { authorization: "Bearer wrong-secret" }))).status).toBe(401)
+    expect((await GET(get(`?secret=${SECRET}`))).status).toBe(401)
+    expect(createAdminClient).not.toHaveBeenCalled()
+  })
+
+  it("runs the same ingest for the cron secret", async () => {
+    const { GET } = await import("@/app/api/admin/ingest-corpus/route")
+
+    const response = await GET(get("", { authorization: `Bearer ${SECRET}` }))
+    expect(response.status).toBe(200)
+
+    const body = await response.json()
+    expect(body.ok).toBe(true)
+    expect(body.docs).toBe(DOCUMENTS.length)
+    expect(body.dryRun).toBe(false)
+    expect(body.report).toEqual(REPORT)
+
+    // Negative control for constraint 11, as in the POST tests: the route used
+    // the mocked factory, so no live service-role client exists in this run.
+    expect(createAdminClient).toHaveBeenCalledTimes(1)
+    expect(collectCorpus).toHaveBeenCalledWith(FAKE_CLIENT)
+    expect(ingestCorpus).toHaveBeenCalledWith({
+      client: FAKE_CLIENT,
+      documents: DOCUMENTS,
+      dryRun: false,
+    })
+  })
+
+  it("passes ?dryRun=1 through to the ingest", async () => {
+    const { GET } = await import("@/app/api/admin/ingest-corpus/route")
+
+    const response = await GET(get("?dryRun=1", { authorization: `Bearer ${SECRET}` }))
+    expect(response.status).toBe(200)
+    expect((await response.json()).dryRun).toBe(true)
+    expect(ingestCorpus.mock.calls[0][0].dryRun).toBe(true)
+  })
+
+  it("answers 500 with the missing-env message when no admin client can be built", async () => {
+    createAdminClient.mockReturnValue(null)
+    const { GET } = await import("@/app/api/admin/ingest-corpus/route")
+
+    const response = await GET(get("", { authorization: `Bearer ${SECRET}` }))
+    expect(response.status).toBe(500)
+    expect(await response.json()).toEqual({
+      ok: false,
+      error: "Missing Supabase service role env vars",
+    })
+    expect(collectCorpus).not.toHaveBeenCalled()
   })
 })

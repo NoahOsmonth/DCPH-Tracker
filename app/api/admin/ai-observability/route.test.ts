@@ -208,12 +208,27 @@ describe("GET /api/admin/ai-observability", () => {
     // no live service-role client exists anywhere in this run.
     expect(createAdminClient).toHaveBeenCalledTimes(1)
     expect(createSupabaseObservabilityPort).toHaveBeenCalledWith(FAKE_CLIENT)
-    expect(createObservabilityStore).toHaveBeenCalledWith({ port: FAKE_PORT })
+    expect(createObservabilityStore).toHaveBeenCalledWith({
+      port: FAKE_PORT,
+      now: expect.any(Function),
+    })
 
     // Both edges omitted: the store owns the default and the clamp.
     expect(summary).toHaveBeenCalledWith({ sinceMs: undefined, untilMs: undefined })
     expect(recent).toHaveBeenCalledWith()
     expect(feedbackSummary).toHaveBeenCalledWith({ sinceMs: undefined, untilMs: undefined })
+  })
+
+  it("pins one clock for the whole request so both windows are the same", async () => {
+    const { GET } = await import("@/app/api/admin/ai-observability/route")
+
+    await GET(get())
+
+    // `summary` and `feedbackSummary` resolve their windows independently, so a
+    // clock read per call could straddle a millisecond and have the body report
+    // two different windows. The injected clock must therefore be fixed.
+    const { now } = createObservabilityStore.mock.calls[0][0] as { now: () => number }
+    expect(now()).toBe(now())
   })
 
   it("parses ISO and epoch edges and passes them through unchanged", async () => {

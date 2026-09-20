@@ -115,8 +115,13 @@ export async function GET(request: NextRequest) {
   const admin = createAdminClient()
   if (admin === null) return fail(500, MISSING_SERVICE_ROLE)
 
+  // One clock read for the whole request: `summary` and `feedbackSummary` each
+  // resolve their own window, and two `Date.now()` calls can straddle a
+  // millisecond, which would have the body report two different windows.
+  const now = Date.now()
   const store = createObservabilityStore({
     port: createSupabaseObservabilityPort(admin as unknown as ObservabilityClient),
+    now: () => now,
   })
 
   try {

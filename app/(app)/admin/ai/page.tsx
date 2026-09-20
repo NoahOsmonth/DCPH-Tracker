@@ -25,8 +25,13 @@ export default async function AdminAiPage() {
   const admin = createAdminClient()
   if (admin === null) return <AiObservabilityReport status="unavailable" />
 
+  // One clock read for the whole render: `summary` and `feedbackSummary` each
+  // resolve their own window, and two `Date.now()` calls can straddle a
+  // millisecond, which would have the page show two different windows.
+  const now = Date.now()
   const store = createObservabilityStore({
     port: createSupabaseObservabilityPort(admin as unknown as ObservabilityClient),
+    now: () => now,
   })
 
   try {

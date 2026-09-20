@@ -104,16 +104,26 @@ function planSourceWording(source: ActivityPart["planSource"]): string {
 /** The stages, in the order the server measures them. */
 const STAGES: { key: keyof ActivityPart["timings"]; label: string }[] = [
   { key: "planMs", label: "Plan" },
-  { key: "retrieveMs", label: "Retrieve" },
+  // `retrieveMs` is measured over resolve + plan + execute (the pipeline's own
+  // comment on the `retrieveStartedAt` block says so), so the label states the
+  // containment rather than implying the two are siblings.
+  { key: "retrieveMs", label: "Retrieve (includes plan)" },
   { key: "assembleMs", label: "Assemble" },
 ]
 
 /**
  * The stages' total, or `null` when the server sent no measurement at all.
  * Absent fields are skipped, never read as zero.
+ *
+ * `retrieveMs` is not added to `planMs`: the server measures retrieve over a
+ * window that contains the plan stage, so adding both counts the planner twice
+ * and reports a duration longer than the request took. Retrieve is the wider
+ * window, so it wins when present and `planMs` is the fallback for a response
+ * that measured only the plan.
  */
 export function totalActivityMs(timings: ActivityPart["timings"]): number | null {
-  const values = [timings.planMs, timings.retrieveMs, timings.assembleMs].filter(
+  const wide = timings.retrieveMs ?? timings.planMs
+  const values = [wide, timings.assembleMs].filter(
     (value): value is number => typeof value === "number"
   )
   if (values.length === 0) return null

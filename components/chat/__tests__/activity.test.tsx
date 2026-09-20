@@ -53,9 +53,12 @@ describe("ActivityTrace summary", () => {
     render(<ActivityTrace activity={ACTIVITY} />)
 
     const button = screen.getByRole("button")
-    // 200 + 1100 + 100 = 1400 ms, all of it the server's own measurement.
+    // 1100 + 100 = 1200 ms, all of it the server's own measurement. The plan's
+    // 200 ms is deliberately not added: retrieve is measured over a window that
+    // contains the plan stage, so summing both would report a duration longer
+    // than the request took.
     expect(button).toHaveTextContent(
-      "2 steps · 1.4 s · searched the catalog, looked up a character"
+      "2 steps · 1.2 s · searched the catalog, looked up a character"
     )
     expect(button).toHaveAccessibleName(/Show details/)
   })
@@ -88,7 +91,7 @@ describe("ActivityTrace expansion", () => {
 
     expect(screen.getByText("Plan")).toBeInTheDocument()
     expect(screen.getByText("200 ms")).toBeInTheDocument()
-    expect(screen.getByText("Retrieve")).toBeInTheDocument()
+    expect(screen.getByText("Retrieve (includes plan)")).toBeInTheDocument()
     expect(screen.getByText("1100 ms")).toBeInTheDocument()
     expect(screen.getByText("Assemble")).toBeInTheDocument()
     expect(screen.getByText("100 ms")).toBeInTheDocument()
@@ -224,7 +227,11 @@ describe("ActivityTrace motion and helpers", () => {
     expect(formatDuration(850)).toBe("850 ms")
     expect(formatDuration(1400)).toBe("1.4 s")
     expect(totalActivityMs({ planMs: null, retrieveMs: null, assembleMs: null })).toBeNull()
-    expect(totalActivityMs({ planMs: 200, retrieveMs: 1100, assembleMs: 100 })).toBe(1400)
+    // Retrieve contains the plan stage, so the wider window wins rather than
+    // both being summed.
+    expect(totalActivityMs({ planMs: 200, retrieveMs: 1100, assembleMs: 100 })).toBe(1200)
+    // A response that measured only the plan still gets an honest total.
+    expect(totalActivityMs({ planMs: 200, retrieveMs: null, assembleMs: 100 })).toBe(300)
     expect(totalActivityMs({ planMs: null, retrieveMs: 1200, assembleMs: null })).toBe(1200)
     expect(toolVerb("search_cases")).toBe("searched the cases")
   })

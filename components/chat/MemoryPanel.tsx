@@ -117,6 +117,9 @@ export function MemoryPanel({ open, onOpenChange, className }: MemoryPanelProps)
   const [cap, setCap] = React.useState<number | null>(null)
   /** `null` is "the response did not say", which is not a claim that memory is off. */
   const [memoryEnabled, setMemoryEnabled] = React.useState<boolean | null>(null)
+  // Radix restores focus only to a `DialogTrigger`, and the panel is opened by a
+  // control outside it, so the opener is captured at mount and put back by hand.
+  const openerRef = React.useRef<HTMLElement | null>(null)
 
   const load = React.useCallback(async () => {
     setLoading(true)
@@ -176,13 +179,23 @@ export function MemoryPanel({ open, onOpenChange, className }: MemoryPanelProps)
     }
   }
 
-  // Radix restores focus to whatever opened the panel and traps Tab while it is
-  // mounted; unmounting on close is what lets it run that restore.
+  // Radix traps Tab while the panel is mounted; its own focus restore only covers
+  // a `DialogTrigger`, so `openerRef` carries that half here.
   if (!open) return null
 
   return (
     <Dialog open onOpenChange={onOpenChange}>
-      <DialogContent className={cn("sm:max-w-md", className)}>
+      <DialogContent
+        className={cn("sm:max-w-md", className)}
+        onOpenAutoFocus={() => {
+          openerRef.current = document.activeElement as HTMLElement | null
+        }}
+        onCloseAutoFocus={(event) => {
+          event.preventDefault()
+          openerRef.current?.focus()
+          openerRef.current = null
+        }}
+      >
         <DialogHeader>
           <DialogTitle>What the bot remembers</DialogTitle>
           <DialogDescription>{DELETE_IS_REAL}</DialogDescription>

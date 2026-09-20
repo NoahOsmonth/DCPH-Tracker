@@ -123,6 +123,10 @@ export function SourcesPanel({
 }: SourcesPanelProps) {
   const reduce = useReducedMotion()
   const headingId = React.useId()
+  // Radix restores focus only to a `DialogTrigger`, and this panel is opened by a
+  // chip that lives outside it, so the opener is captured at mount and put back
+  // by hand — otherwise closing the modal leaves focus on `<body>`.
+  const openerRef = React.useRef<HTMLElement | null>(null)
 
   // An inline panel has no focus trap, so nothing inside it necessarily holds
   // focus when Escape is pressed. A document listener is what makes Escape
@@ -143,7 +147,17 @@ export function SourcesPanel({
   if (modal) {
     return (
       <Dialog open onOpenChange={onOpenChange}>
-        <DialogContent className={className}>
+        <DialogContent
+          className={className}
+          onOpenAutoFocus={() => {
+            openerRef.current = document.activeElement as HTMLElement | null
+          }}
+          onCloseAutoFocus={(event) => {
+            event.preventDefault()
+            openerRef.current?.focus()
+            openerRef.current = null
+          }}
+        >
           <DialogHeader>
             <DialogTitle>{title}</DialogTitle>
             <DialogDescription>Every source this answer was given.</DialogDescription>

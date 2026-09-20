@@ -104,6 +104,9 @@ export function ConversationDrawer({
   const [pendingSelectId, setPendingSelectId] = React.useState<string | null>(null)
   /** The row whose inline archive confirmation is showing. One at a time. */
   const [confirmingId, setConfirmingId] = React.useState<string | null>(null)
+  // Radix restores focus only to a `DialogTrigger`, and the drawer is opened by a
+  // control outside it, so the opener is captured at mount and put back by hand.
+  const openerRef = React.useRef<HTMLElement | null>(null)
 
   const load = React.useCallback(async () => {
     setLoading(true)
@@ -178,13 +181,23 @@ export function ConversationDrawer({
     }
   }
 
-  // Radix restores focus to whatever opened the drawer and traps Tab while it is
-  // mounted; unmounting on close is what lets it run that restore.
+  // Radix traps Tab while the drawer is mounted; its own focus restore only
+  // covers a `DialogTrigger`, so `openerRef` carries that half here.
   if (!open) return null
 
   return (
     <Dialog open onOpenChange={onOpenChange}>
-      <DialogContent className={cn("sm:max-w-md", className)}>
+      <DialogContent
+        className={cn("sm:max-w-md", className)}
+        onOpenAutoFocus={() => {
+          openerRef.current = document.activeElement as HTMLElement | null
+        }}
+        onCloseAutoFocus={(event) => {
+          event.preventDefault()
+          openerRef.current?.focus()
+          openerRef.current = null
+        }}
+      >
         <DialogHeader>
           <DialogTitle>Conversations</DialogTitle>
           <DialogDescription>Reopen a past conversation, or archive one you are done with.</DialogDescription>

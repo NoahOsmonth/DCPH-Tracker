@@ -460,6 +460,19 @@ which is the fact that matters here — `createUIMessageStreamResponse` is the s
 `app/api/ai-chat/route.ts` uses. The documentation carries the precise form, so a reader looking for the
 name is not told it is nowhere.
 
+**C35 — two files were touched that no task's file list names, both deliberately.** The first is
+`components/ui/dialog.tsx`, whose close control had a 16 px hit area — under the 24 px minimum of
+WCAG 2.2 SC 2.5.8 — on a control every dialog in the app renders. Task 11 item 6 asks for touch targets
+and this is the most-tapped one in a panel, so it was raised to 24 px with `p-1` and the offsets dropped
+to `3`, which leaves the glyph's position and the control's visual weight unchanged. The edit is confined
+to the close button; `DialogContent`'s layout classes, `DialogOverlay`, header, footer, title and
+description are untouched, so no other dialog's layout moves. The second is `lib/ai/memory/flag.ts`
+plus the re-export in `lib/chat/persistence.ts`, which is C30's signal: Task 10's file list named only
+the panel, and completion criterion 7 requires a disabled-memory state the endpoint could not express, so
+the flag moved to an import-free module the transparency route can read without the provider graph.
+Both are recorded here because criterion 12 asks for every deviation, and a silent edit to a shared
+primitive is exactly the kind a later reader would not expect.
+
 ---
 
 ### Task 1 — Dependencies, jsdom project, smoke test

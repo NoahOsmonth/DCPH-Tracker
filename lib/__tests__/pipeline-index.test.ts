@@ -279,6 +279,28 @@ describe("runPipeline in v2", () => {
     expect(typeof executed.toolCtx.wiki.lookup).toBe("function")
   })
 
+  it("plans the message and searches the retrieval query, which are not the same string", async () => {
+    // The route joins the previous user turn onto the message for retrieval —
+    // a follow-up names no topic of its own — and that joined string must not
+    // reach the planner, whose prompt calls its input "Current user message".
+    // Handing it two questions asked it to plan for something the user never
+    // said, and the router read a prior turn's episode number as this
+    // question's.
+    const retrievalQuery = "Earlier question Who is Haibara?"
+
+    await pipeline(input({ retrievalQuery }))
+
+    expect(planSpy.mock.calls[0][0].message).toBe(MESSAGE)
+    expect(executeSpy.mock.calls[0][0].query).toBe(retrievalQuery)
+  })
+
+  it("searches the message itself when no retrieval query is given", async () => {
+    await pipeline(input())
+
+    expect(planSpy.mock.calls[0][0].message).toBe(MESSAGE)
+    expect(executeSpy.mock.calls[0][0].query).toBe(MESSAGE)
+  })
+
   it("reports the dispatched tools deduped, in execution order", async () => {
     executeSpy.mockImplementationOnce(async () =>
       executeReport({

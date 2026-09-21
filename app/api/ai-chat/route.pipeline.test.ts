@@ -614,11 +614,13 @@ describe("POST /api/ai-chat through the agentic pipeline", () => {
     const pipelineInput = runPipeline.mock.calls[0]?.[0] as PipelineInput
     expect(pipelineInput.memories).toContain("[MEM] favorite_character")
     expect(pipelineInput.summary).toBe("They discussed episode 5.")
-    // The retrieval query is the route's composed `searchQuery` (previous user
-    // turn + this message) — the string v1's `searchAll` searched with, and
-    // what `PipelineInput.message` documents. The current turn is appended to
-    // the messages separately.
-    expect(pipelineInput.message).toBe("Earlier question Who is Haibara?")
+    // Two values, two jobs. The planner's prompt labels its input "Current user
+    // message", so `message` is the user's own words; `retrievalQuery` is the
+    // route's composed string (previous user turn + this message) that the
+    // ladder searches for, because a follow-up names no topic of its own. The
+    // current turn is appended to the messages separately.
+    expect(pipelineInput.message).toBe("Who is Haibara?")
+    expect(pipelineInput.retrievalQuery).toBe("Earlier question Who is Haibara?")
   })
 
   it("aborts the planner's signal when the client disconnects during planning", async () => {

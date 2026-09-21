@@ -374,6 +374,11 @@ export async function POST(request: Request) {
   const priorTurns = windowTurns ?? clientHistory
   const priorUserMessages = priorTurns.filter((t) => t.role === "user").map((t) => t.content)
 
+  // The retrieval query, not the message. A follow-up ("who was the victim?")
+  // names no topic of its own, so the turn before it is joined on as the topic
+  // to search for. This value goes to the retrieval stages only: the planner
+  // and the router are given `userMessage`, because the planner's prompt labels
+  // its input "Current user message" and two questions concatenated is not one.
   const lastUserTurn = [...priorTurns].reverse().find((t) => t.role === "user")
   const searchQuery = lastUserTurn ? `${lastUserTurn.content} ${userMessage}` : userMessage
 
@@ -447,7 +452,8 @@ export async function POST(request: Request) {
 
     try {
       pipelineResult = await runPipeline({
-        message: searchQuery,
+        message: userMessage,
+        retrievalQuery: searchQuery,
         priorTurns,
         priorUserMessages,
         systemPrompt,

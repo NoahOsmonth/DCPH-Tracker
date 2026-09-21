@@ -107,11 +107,24 @@ export interface ScreeningReport {
 
 export interface PipelineInput {
   /**
-   * The retrieval query: what the planner plans and the ladder searches for.
-   * The route passes its `searchQuery`, not the user's raw message — the turn
-   * the model sees is the route's to append (see the module note above).
+   * The user's message: what the planner is asked to plan for and the router
+   * routes. This is the user's own words, never a query built from them.
    */
   message: string
+  /**
+   * The retrieval query the ladder searches for. Defaults to `message`.
+   *
+   * The route passes the previous user turn joined onto the message, because a
+   * follow-up ("who was the victim?") names no topic of its own and the turn
+   * before it is the topic. It is deliberately a separate value rather than
+   * being folded into `message`: the planner's prompt labels its input
+   * "Current user message", so handing it two questions concatenated asks it to
+   * plan for something the user never said, and the router reads episode
+   * numbers and entities out of whatever it is given — a prior turn's "episode
+   * 7" used to plan a `classify_episode` step for a question that mentions no
+   * number at all.
+   */
+  retrievalQuery?: string
   /** The window's turns, oldest first, for the assembler. */
   priorTurns: PersistedTurn[]
   /** The user's recent turns, for the planner's prompt. */
@@ -219,6 +232,9 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineResult 
 
   const now = input.now ?? Date.now
   const log = input.log ?? (() => {})
+  // Read once: every retrieval in this file searches for the same string, and
+  // only the planner and the router see the message itself.
+  const retrievalQuery = input.retrievalQuery ?? input.message
   // Mutated as each stage completes, so a stage that throws still reports what
   // the stages before it cost.
   const timings: PipelineTimings = { planMs: 0, retrieveMs: 0, assembleMs: 0 }
@@ -248,7 +264,7 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineResult 
 
     const report = await executePlan({
       plan: planned.plan,
-      query: input.message,
+      query: input.retrievalQuery ?? input.message,
       deps,
       toolCtx: toolContext(deps, input.toolCtx),
       now,
@@ -271,7 +287,7 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineResult 
       log("pipeline: the static corpus found nothing, falling back to the legacy retrieval")
       const fallbackStartedAt = now()
       try {
-        const legacy = await legacyEvidence(input.message, input.userId ?? "")
+        const legacy = await legacyEvidence(retrievalQuery, input.userId ?? "")
         const converted = screenEvidence(legacy.docs, legacy.wiki)
         // The evidence is replaced, the screening is merged: what the ladder's
         // own documents cost must stay countable in the log even when the

@@ -18,6 +18,7 @@
  *    repeats one step must not spend the tool call twice.
  */
 import { z } from "zod"
+import { normalizeText } from "@/lib/chat/query"
 
 /**
  * The tools a plan may name. Deliberately a superset of the registry's
@@ -145,13 +146,61 @@ export type QueryPlan = z.infer<typeof QueryPlanSchema>
  *
  * Returns null for anything that does not satisfy the schema — no throw, no
  * partial plan — and collapses repeated steps so the executor never dispatches
- * the same tool call twice.
+ * the same tool call twice. `keywords` is normalized to the vocabulary the
+ * scorer reads (see `normalizeKeywords`).
  */
 export function parseQueryPlan(value: unknown): QueryPlan | null {
   const result = QueryPlanSchema.safeParse(value)
   if (!result.success) return null
 
-  return { ...result.data, steps: dedupeSteps(result.data.steps) }
+  return {
+    ...result.data,
+    keywords: normalizeKeywords(result.data.keywords),
+    steps: dedupeSteps(result.data.steps),
+  }
+}
+
+/**
+ * The plan's keywords, brought into the form the rest of the pipeline assumes.
+ *
+ * `keywords` is a vocabulary, not prose: `scoreEntry` tests each one with
+ * `normalizeText(field).includes(keyword)`, so a keyword that is not already
+ * lowercase and stripped of punctuation matches nothing at all. The router
+ * cannot produce such a keyword — it builds its list from `tokenize` and
+ * `normalizeText` — but the model returns whatever it likes, and capitalised
+ * text is what it likes.
+ *
+ * Measured on "Who was the victim in the Til Death Do Us Part case?": the
+ * router's plan retrieved `case:'Til Death Do Us Part#1` and `#2`, the two
+ * documents that answer the question, while the model's plan retrieved twelve
+ * documents whose titles merely contain "victim" — every word of the phrase
+ * failed the case-sensitive substring test, so the one keyword the model
+ * happened to write in lowercase was the only one that matched anything. The
+ * model's plan looked identical to the router's and ranked a different corpus.
+ *
+ * Normalizing here rather than inside `scoreEntry` keeps the scorer's existing
+ * contract intact and makes both planners speak one language. Empties are
+ * dropped: a keyword of nothing but punctuation normalizes to "", and `"".includes`
+ * is true for every field.
+ *
+ * A multi-word keyword is deliberately NOT split into tokens. The router adds
+ * whole names on purpose — "ai haibara", "voice changing bowtie" — because
+ * `entityScore` scores an exact title or alias above a token hit, and splitting
+ * them costs that tier; `pipeline-router.test.ts` pins both names for exactly
+ * this reason. Splitting the model's phrases would help the scorer's title
+ * bonuses and hurt the entity branch, so the fix stays on the side that was
+ * actually broken.
+ */
+function normalizeKeywords(keywords: string[]): string[] {
+  const normalized: string[] = []
+
+  for (const keyword of keywords) {
+    const value = normalizeText(keyword)
+    if (value.length === 0 || normalized.includes(value)) continue
+    normalized.push(value)
+  }
+
+  return normalized
 }
 
 /** The distinct tools a plan names, in first-mention order. */

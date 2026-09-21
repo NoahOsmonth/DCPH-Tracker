@@ -173,6 +173,34 @@ describe("parseQueryPlan", () => {
     expect(parseQueryPlan(plan)).toEqual(plan)
   })
 
+  it("lowercases the model's keywords, because the scorer matches them literally", () => {
+    // `scoreEntry` tests each keyword with `normalizeText(field).includes(kw)`,
+    // so a capitalised keyword matches nothing. The router cannot emit one --
+    // it builds its list from `tokenize` -- but the model returns prose, and
+    // "Til Death Do Us Part" is the shape that made it rank a different corpus
+    // than the router for the same question.
+    const plan = parseQueryPlan(validPlan({ keywords: ["Til Death Do Us Part", "Victim"] }))
+
+    expect(plan?.keywords).toEqual(["til death do us part", "victim"])
+  })
+
+  it("keeps a multi-word keyword whole rather than splitting it into tokens", () => {
+    // The router adds whole names on purpose: `entityScore` scores an exact
+    // title or alias above a token hit, and "ai haibara" is what earns that
+    // tier. Splitting it here would quietly cost the entity branch its best rule.
+    const plan = parseQueryPlan(validPlan({ keywords: ["Ai Haibara", "voice changing bowtie"] }))
+
+    expect(plan?.keywords).toEqual(["ai haibara", "voice changing bowtie"])
+  })
+
+  it("drops a keyword that normalizes to nothing", () => {
+    // `"".includes` is true for every field, so an empty keyword would score
+    // against the whole corpus.
+    const plan = parseQueryPlan(validPlan({ keywords: ["!!!", "haibara"] }))
+
+    expect(plan?.keywords).toEqual(["haibara"])
+  })
+
   it("returns null for anything the schema rejects, never a partial plan", () => {
     const rejected: unknown[] = [
       null,

@@ -39,8 +39,19 @@ import { generateStructured, type StructuredCall } from "@/lib/ai/structured"
 /**
  * The hard bound on the planning stage. Constraint 10: the response path must not get
  * slower, so the stage degrades to the router's plan when it overruns.
+ *
+ * 1200 was below every configured provider's floor, which made the bound an off switch
+ * rather than a guard: measured over 12 calls to the real targets, the planner answered
+ * in 1027-1694 ms, so it overran on three quarters of questions and `source=fallback`
+ * with `planner_timeout` was the normal outcome, not the exceptional one. The plans it
+ * does return are the reason this stage exists — "What is the relationship between Conan
+ * and Ran?" comes back as `lookup_character{Ran Mouri}` plus a `wiki_lookup`, and "Which
+ * movie is The Time-Bombed Skyscraper?" as a single `search_catalog` — and the router
+ * only defers to the model when it is not confident, so the extra time is spent exactly
+ * on the questions the router cannot answer. 2500 keeps ~48% headroom over the slowest
+ * measured call while still bounding the stage well inside the request's own budget.
  */
-export const PLANNER_BUDGET_MS = 1200
+export const PLANNER_BUDGET_MS = 2500
 
 /** D1's three modes, read from `AI_PLANNER`. */
 export const PLANNER_MODES = ["auto", "always", "off"] as const

@@ -213,6 +213,66 @@ function logFailureAndReturnEmpty(branch: string, error: unknown): never[] {
   return []
 }
 
+/** One log line for a branch that partially failed; the successful batches are
+ *  still worth returning. */
+function logPartialFailure(branch: string, error: unknown): void {
+  console.error(
+    `[ai-retrieval] ${branch} batch failed`,
+    error instanceof Error ? error.message : String(error)
+  )
+}
+
+/**
+ * The most percent-encoded characters of ids one hydration request may carry.
+ *
+ * Hydration is the one branch whose arguments are unbounded: the ladder hands it
+ * every fused candidate, and R1's pool alone is 100 ids. PostgREST travels that
+ * list in the query string (`id=in.(...)`), and the API gateway answers a request
+ * line over 8 KB with 414 "URI too long" — measured against the local stack at
+ * 8203 characters, still passing at 6723. A fused set reaches ~180 ids averaging
+ * 35 encoded characters ("case:Til Death Do Us Part#1"), so one request is not
+ * always possible, and the failure is total: 414 is an error, not an empty
+ * result, so the ladder lost every document and the bot refused to answer a
+ * question it had the evidence for.
+ *
+ * Batches are sized by encoded length rather than by count, because id length
+ * varies by source. 4000 leaves the 8 KB limit a factor of two of headroom for
+ * the path, the select list and the rest of the query.
+ */
+const HYDRATE_BATCH_CHARS = 4000
+
+/** A ceiling on round trips for a pathological corpus of very short ids. */
+const HYDRATE_BATCH_MAX = 50
+
+/**
+ * Splits ids into requests that each fit `HYDRATE_BATCH_CHARS`.
+ *
+ * A single id over the budget still gets a batch of its own rather than being
+ * dropped: a request that fails is recoverable, a silently missing document is
+ * not.
+ */
+function batchIds(ids: string[]): string[][] {
+  const batches: string[][] = []
+  let current: string[] = []
+  let size = 0
+
+  for (const id of ids) {
+    // +1 for the separating comma, which is not percent-encoded.
+    const cost = encodeURIComponent(id).length + 1
+    if (current.length > 0 && (size + cost > HYDRATE_BATCH_CHARS || current.length >= HYDRATE_BATCH_MAX)) {
+      batches.push(current)
+      current = []
+      size = 0
+    }
+    current.push(id)
+    size += cost
+  }
+
+  if (current.length > 0) batches.push(current)
+
+  return batches
+}
+
 export function createSupabaseSource(client: DocsRpcClient): DocumentSource {
   return {
     async entity({ numbers, names, limit }) {
@@ -262,9 +322,26 @@ export function createSupabaseSource(client: DocsRpcClient): DocumentSource {
       if (ids.length === 0) return []
 
       try {
-        const { data, error } = await client.from("ai_documents").select("*").in("id", ids)
-        if (error) return logFailureAndReturnEmpty("fetch", error.message)
-        return (data ?? []).map(rowToDocument)
+        // The batches are independent reads, so they go out together: the ladder
+        // is on a 1500 ms budget and a serialized round trip per batch would
+        // spend it on latency.
+        const results = await Promise.all(
+          batchIds(ids).map((batch) => client.from("ai_documents").select("*").in("id", batch))
+        )
+
+        const found: CorpusDocument[] = []
+        for (const { data, error } of results) {
+          // A batch that failed is logged and skipped rather than zeroing the
+          // whole hydration: 100 of 180 documents is an answer, none is a
+          // refusal. `rankCandidates` already tolerates a candidate with no
+          // document, which is the same shape as one whose batch did not arrive.
+          if (error) {
+            logPartialFailure("fetch", error.message)
+            continue
+          }
+          for (const row of data ?? []) found.push(rowToDocument(row))
+        }
+        return found
       } catch (err) {
         return logFailureAndReturnEmpty("fetch", err)
       }

@@ -428,6 +428,61 @@ describe("createSupabaseSource", () => {
     expect(selectCalls).toEqual([])
   })
 
+  it("splits a hydration list that would not fit in one request line", async () => {
+    // The ladder hands hydration every fused candidate, and R1 alone can supply
+    // a hundred ids. `in.(...)` travels in the query string, and the gateway
+    // rejects a request line over 8 KB with 414 rather than with an empty
+    // result, which cost the ladder every document it had found. These ids are
+    // the real shape and length of the case records that triggered it.
+    const ids = Array.from({ length: 180 }, (_, index) => `case:Til Death Do Us Part#${index + 1}`)
+    const { client, selectCalls } = createRecordingClient([])
+
+    await createSupabaseSource(client).fetch(ids)
+
+    expect(selectCalls.length).toBeGreaterThan(1)
+    expect(selectCalls.flatMap((call) => call.values)).toEqual(ids)
+    for (const call of selectCalls) {
+      const query = call.values.map((id) => encodeURIComponent(id)).join(",")
+      expect(query.length).toBeLessThanOrEqual(4000)
+    }
+  })
+
+  it("keeps the documents of the batches that arrived when one fails", async () => {
+    // A partial hydration is an answer; zeroing it is a refusal. `rankCandidates`
+    // treats a candidate with no document as a miss, which is the same shape as
+    // one whose batch never landed.
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {})
+    const ids = Array.from({ length: 120 }, (_, index) => `entry:ep-${index + 1}`)
+    let call = 0
+    const client: DocsRpcClient = {
+      async rpc() {
+        return { data: null, error: null }
+      },
+      from() {
+        return {
+          select() {
+            return {
+              async in(column, values) {
+                call += 1
+                if (call === 2) return { data: null, error: { message: "URI too long" } }
+                return {
+                  data: values.map((id) => ({ ...MOVIE_ROW, id })),
+                  error: null,
+                }
+              },
+            }
+          },
+        }
+      },
+    }
+
+    const docs = await createSupabaseSource(client).fetch(ids)
+
+    expect(docs.length).toBe(ids.length - 50)
+    expect(spy.mock.calls[0]?.[0]).toContain("[ai-retrieval] fetch batch failed")
+    expect(spy.mock.calls[0]?.[1]).toBe("URI too long")
+  })
+
   it("degrades every branch to [] when the RPC reports an error", async () => {
     const spy = vi.spyOn(console, "error").mockImplementation(() => {})
     const source = createSupabaseSource(createErroringClient())

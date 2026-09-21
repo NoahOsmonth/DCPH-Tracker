@@ -413,6 +413,12 @@ export function createGateway(deps: GatewayDeps = {}): Gateway {
         const decoder = new TextDecoder()
         const reader = response.body.getReader()
         const deadline = startedAt + streamTimeoutMs
+        // The first-token budget is measured against the clock, not against
+        // read inactivity: a reasoning-only model keeps the socket busy with
+        // `reasoning_content` frames, and every one of them resets the read
+        // timer, so an inactivity check would let it hold the target for the
+        // whole stream timeout without ever emitting content.
+        const contentDeadline = startedAt + firstTokenTimeoutMs
         let textChars = 0
         let truncated = false
         let midStreamFailure = false
@@ -424,6 +430,15 @@ export function createGateway(deps: GatewayDeps = {}): Gateway {
             if (now() > deadline) {
               truncated = true
               streamError = "stream timeout"
+              break
+            }
+
+            if (!firstTokenSeen && now() > contentDeadline) {
+              truncated = true
+              streamError = FIRST_TOKEN_TIMEOUT
+              // The read is not pending here, but the provider is about to be
+              // dropped, so cancel rather than leave the body half-read.
+              await reader.cancel().catch(() => {})
               break
             }
 

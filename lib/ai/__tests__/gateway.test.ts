@@ -265,6 +265,47 @@ describe("createGateway", () => {
     expect(reasoning.join("")).toBe("hmm")
   })
 
+  it("gives up on a reasoning-only stream at the first-token deadline", async () => {
+    // A model that streams `reasoning_content` and never content keeps the
+    // socket busy, so a check that measures read inactivity never fires and the
+    // target is held for the whole stream timeout. The clock advances with the
+    // stream, so the assertion is about the deadline rather than the wall clock.
+    let clock = NOW
+    const encoder = new TextEncoder()
+    const gateway = createTestGateway({
+      now: () => clock,
+      fetchImpl: async () =>
+        new Response(
+          new ReadableStream({
+            pull(controller) {
+              clock += 1_000
+              controller.enqueue(
+                encoder.encode(
+                  'data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}\n\n'
+                )
+              )
+            },
+          }),
+          { status: 200 }
+        ),
+    })
+
+    const result = await gateway.streamChat({
+      messages: [{ role: "user", content: "hi" }],
+      targets: [target("groq:a")],
+      signal: new AbortController().signal,
+      onDelta: () => {},
+      firstTokenTimeoutMs: 4_000,
+      streamTimeoutMs: 30_000,
+    })
+
+    expect(result.ok).toBe(false)
+    expect(result.textChars).toBe(0)
+    expect(result.attempts[0]).toMatchObject({ targetId: "groq:a", outcome: "timeout" })
+    // Well below the stream timeout, which is the fault this guards against.
+    expect(clock - NOW).toBeLessThan(30_000)
+  })
+
   it("stops cleanly when the client aborts", async () => {
     const controller = new AbortController()
     const gateway = createTestGateway({

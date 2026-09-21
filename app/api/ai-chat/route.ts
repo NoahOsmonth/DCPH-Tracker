@@ -56,8 +56,14 @@ const TOTAL_BUDGET_MS = 45_000
  * The ceiling on each transcript read the pre-stream path makes (rule 7). The
  * store owns every database detail behind the persistence seam, so a slow
  * database has one cost here: the client's own history is used instead.
+ *
+ * At 400ms that cost was paid on a healthy local database — a transcript
+ * window read over PostgREST measured past the ceiling, so the turn silently
+ * lost its history. The window is small enough to serve well inside this
+ * number, and the number is small enough that several of these reads still fit
+ * the request budget.
  */
-const PERSISTENCE_TIMEOUT_MS = 400
+const PERSISTENCE_TIMEOUT_MS = 1200
 
 const RATE_LIMIT = { limit: 20, windowMs: 5 * 60 * 1000 }
 
@@ -627,6 +633,13 @@ export async function POST(request: Request) {
           if (result.textChars > 0 && !request.signal.aborted) {
             syntheticReason = PARTIAL_ANSWER_REASON
             writeText(PARTIAL_RESULT_SUFFIX)
+          } else if (!request.signal.aborted) {
+            // The budget expired before any provider produced a character. A
+            // turn that ends in silence is indistinguishable from a hang, so
+            // the reader gets the sentence an exhausted provider pool gets —
+            // which is what a run of failed targets amounts to.
+            syntheticReason = RATE_LIMITED_REASON
+            writeText(RATE_LIMITED_MESSAGE)
           }
         } else if (!result.ok) {
           syntheticReason = result.rateLimited ? RATE_LIMITED_REASON : EMPTY_RESULT_REASON

@@ -80,14 +80,26 @@ export function resolveProviderEnv(
  *                                  1,644 reasoning characters on one call.
  *   liquid/lfm-2.5-2.6b:free     - too small to follow the grounding rules.
  *   poolside/laguna-s-2.1:free   - a code model, not an instruction follower.
+ *   minimax/minimax-m3:free      - withdrawn from the catalog; the gateway
+ *   minimax/minimax-m2.7:free      spent a request on the 404 before failing
+ *                                  over, and the circuit recorded it as a
+ *                                  provider outage rather than a bad model id.
+ *   nvidia/nemotron-3.5-lightning:free
+ *                                - streamed reasoning for the full 30s stream
+ *                                  timeout and never emitted a content
+ *                                  character, twice, at two different prompts.
+ *
+ * Order is by measured first-answer reliability, not by preference: the
+ * gateway walks this list in order, so a model that 429s or stalls costs every
+ * request its full failover time. Re-measure before reordering — a `:free`
+ * model's behaviour changes without notice.
  */
 const OPENROUTER_MODELS = [
-  "minimax/minimax-m3:free",
-  "minimax/minimax-m2.7:free",
-  "google/gemma-4-31b-it:free",
-  "z-ai/glm-5.2:free",
-  "nvidia/nemotron-3.5-lightning:free",
+  "nvidia/nemotron-3-super-120b-a12b:free",
   "inclusionai/ling-3.0-flash-fin:free",
+  "google/gemma-4-31b-it:free",
+  "qwen/qwen3.8-27b:free",
+  "z-ai/glm-5.2:free",
 ]
 
 const GEMINI_MODELS = [

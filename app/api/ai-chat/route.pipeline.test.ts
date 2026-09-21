@@ -536,6 +536,42 @@ describe("POST /api/ai-chat through the agentic pipeline", () => {
     expect(degraded.reasons).toEqual(["rate_limited"])
   })
 
+  it("tells the reader when the budget expires before any provider answers", async () => {
+    // Every target is still streaming when the request budget runs out, so the
+    // turn has no answer and no provider verdict of its own. Ending it silently
+    // is indistinguishable from a hang, so the reader gets the capacity
+    // sentence and the state that produced it.
+    runPipeline.mockResolvedValue(assembledResult(scored(doc(1))))
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        (_url: string, init: { signal: AbortSignal }) =>
+          new Promise<Response>((_resolve, reject) => {
+            init.signal.addEventListener("abort", () => {
+              const error = new Error("aborted")
+              error.name = "AbortError"
+              reject(error)
+            })
+          })
+      )
+    )
+    const { POST } = await import("@/app/api/ai-chat/route")
+
+    vi.useFakeTimers()
+    try {
+      const pending = POST(post({ message: USER_MESSAGE }))
+      await vi.advanceTimersByTimeAsync(45_000)
+      const { message } = await readStream(await pending)
+
+      expect(answerText(message)).toMatch(/at capacity/i)
+      const degraded = dataPart(message, PARTS.degraded)
+      if (!isDegradedPart(degraded)) throw new Error("no degraded part")
+      expect(degraded.reasons).toEqual(["rate_limited"])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it("assembles the memory block and the summary through the pipeline, not the prompt builder", async () => {
     persistence.window.mockResolvedValue({
       summary: "They discussed episode 5.",

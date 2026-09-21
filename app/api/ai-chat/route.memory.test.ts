@@ -362,7 +362,7 @@ describe("POST /api/ai-chat with server-owned transcripts", () => {
     expect(persistence.afterTurn).toHaveBeenCalledWith({ answer: "The victim was" })
   })
 
-  it("degrades to the client's history when resolution exceeds 400 ms", async () => {
+  it("degrades to the client's history when resolution exceeds 1200 ms", async () => {
     vi.useFakeTimers()
     const spy = vi.spyOn(console, "error").mockImplementation(() => {})
     createRequestPersistence.mockReturnValue(new Promise(() => {}))
@@ -373,7 +373,7 @@ describe("POST /api/ai-chat with server-owned transcripts", () => {
     const pending = POST(
       post({ message: USER_MESSAGE, history: [{ role: "user", content: "earlier question" }] })
     )
-    await vi.advanceTimersByTimeAsync(400)
+    await vi.advanceTimersByTimeAsync(1200)
     const response = await pending
 
     expect(response.status).toBe(200)
@@ -383,7 +383,7 @@ describe("POST /api/ai-chat with server-owned transcripts", () => {
     spy.mockRestore()
   })
 
-  it("falls back to the client's history when the window read exceeds 400 ms", async () => {
+  it("falls back to the client's history when the window read exceeds 1200 ms", async () => {
     vi.useFakeTimers()
     const spy = vi.spyOn(console, "error").mockImplementation(() => {})
     persistence.window.mockReturnValue(new Promise(() => {}))
@@ -394,7 +394,7 @@ describe("POST /api/ai-chat with server-owned transcripts", () => {
     const pending = POST(
       post({ message: USER_MESSAGE, history: [{ role: "user", content: "earlier question" }] })
     )
-    await vi.advanceTimersByTimeAsync(400)
+    await vi.advanceTimersByTimeAsync(1200)
     const response = await pending
 
     expect(answerText(await readStream(response))).toBe("Hi there")
@@ -403,7 +403,7 @@ describe("POST /api/ai-chat with server-owned transcripts", () => {
     spy.mockRestore()
   })
 
-  it("answers without a memory block when the fact read exceeds 400 ms", async () => {
+  it("answers without a memory block when the fact read exceeds 1200 ms", async () => {
     vi.useFakeTimers()
     const spy = vi.spyOn(console, "error").mockImplementation(() => {})
     persistence.memories.mockReturnValue(new Promise(() => {}))
@@ -411,7 +411,7 @@ describe("POST /api/ai-chat with server-owned transcripts", () => {
     const { POST } = await import("@/app/api/ai-chat/route")
 
     const pending = POST(post({ message: USER_MESSAGE }))
-    await vi.advanceTimersByTimeAsync(400)
+    await vi.advanceTimersByTimeAsync(1200)
     const response = await pending
 
     expect(answerText(await readStream(response))).toBe("Hi there")
@@ -492,7 +492,7 @@ describe("POST /api/ai-chat with a memory question", () => {
     expect(fetchMock).toHaveBeenCalled()
   })
 
-  it("falls through to the model when the memory read exceeds 400 ms", async () => {
+  it("falls through to the model when the memory read exceeds 1200 ms", async () => {
     vi.useFakeTimers()
     const spy = vi.spyOn(console, "error").mockImplementation(() => {})
     persistence.recallAnswer.mockReturnValue(new Promise(() => {}))
@@ -508,7 +508,7 @@ describe("POST /api/ai-chat with a memory question", () => {
         history: [{ role: "user", content: "Who is Haibara?" }],
       })
     )
-    await vi.advanceTimersByTimeAsync(400)
+    await vi.advanceTimersByTimeAsync(1200)
     const response = await pending
 
     expect(answerText(await readStream(response))).toBe("Hi there")

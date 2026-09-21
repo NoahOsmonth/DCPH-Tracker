@@ -25,6 +25,58 @@ export interface ScoredDoc {
 }
 
 /**
+ * How many records of one case may lead the list.
+ *
+ * A `case:` document is one crime template of one episode or movie, and a case
+ * can hold fifteen of them (measured: "The Raven Chaser"). They score alike —
+ * they share a page title, a crime type and most of their text — so without a
+ * cap six of them take the top of a twelve-document window and the episode they
+ * belong to never appears, which was the evidence the question wanted. Two
+ * stay, which is enough to show a case is multi-part; the rest are demoted, not
+ * dropped, so a question whose answer sits in the seventh record still finds it
+ * as long as the window reaches that far.
+ */
+const SIBLING_CAP = 2
+
+/**
+ * The case a document is a record of, or null when it is not a record.
+ *
+ * `metadata.page_title` is the case's own title, and the corpus builders set it
+ * on the `case:` rows and nowhere else (2016 of 2016 case documents, 0 of the
+ * other 1633), so it is both the sibling key and the test for "is a record".
+ */
+function siblingKey(doc: CorpusDocument): string | null {
+  const pageTitle = doc.metadata.page_title
+  return typeof pageTitle === "string" && pageTitle.length > 0 ? pageTitle : null
+}
+
+/**
+ * Moves the records of a case after the first `cap` of them, preserving both
+ * groups' internal order. Pure: neither the input array nor an entry is
+ * mutated, and every document is kept.
+ */
+function diversifyRecords(docs: ScoredDoc[], cap: number): ScoredDoc[] {
+  const seen = new Map<string, number>()
+  const lead: ScoredDoc[] = []
+  const deferred: ScoredDoc[] = []
+
+  for (const entry of docs) {
+    const key = siblingKey(entry.doc)
+    if (key === null) {
+      lead.push(entry)
+      continue
+    }
+
+    const count = seen.get(key) ?? 0
+    seen.set(key, count + 1)
+    if (count < cap) lead.push(entry)
+    else deferred.push(entry)
+  }
+
+  return [...lead, ...deferred]
+}
+
+/**
  * Ranks fused candidates by the scorer's verdict, keeping the candidates it
  * cannot score.
  *
@@ -35,8 +87,12 @@ export interface ScoredDoc {
  * fuzzy branch's entire output, so they survive, ordered by rrf, after every
  * document that scored.
  *
- * `limit` (default 12) truncates the concatenation of both groups, never the
- * scored group alone, or the survivors could push the result past the cap.
+ * The scored group is then diversified by `diversifyRecords`, which demotes the
+ * third and later records of one case behind the rest of the group: a case can
+ * hold fifteen crime templates that all score alike, and without the cap they
+ * are the whole window. `limit` (default 12) truncates the concatenation of
+ * both groups, never the scored group alone, or the survivors could push the
+ * result past the cap.
  */
 export function rankCandidates(
   candidates: FusedCandidate[],
@@ -84,18 +140,25 @@ export function rankCandidates(
 
   // rankEntries is the authority on the scored group's order (score desc, then
   // the chronological preference, then air date); the map only re-attaches the
-  // rrf and origins the scorer cannot know about. `limit` is passed through
-  // because the scored group is capped on its own terms as well.
+  // rrf and origins the scorer cannot know about.
+  //
+  // Its own cap is raised to the pool size rather than left at `limit`: the
+  // diversification below has to see the whole scored group to pull a document
+  // out from behind a case's records, and a document it cannot see is one the
+  // model never sees. The cap that matters is the slice at the end, which is
+  // applied to the concatenation — so the result is still exactly `limit` long.
   const scored: ScoredDoc[] = []
   const ranked = rankEntries(
     ordered.map((row) => row.doc),
     keywords,
-    { limit, numbers, preferRecent, preferEarliest, fieldsOf: toRankable }
+    { limit: ordered.length, numbers, preferRecent, preferEarliest, fieldsOf: toRankable }
   )
   for (const doc of ranked) {
     const entry = scoredById.get(doc.id)
     if (entry) scored.push(entry)
   }
 
-  return [...scored, ...survivors].slice(0, limit)
+  // The survivors stay last: the demotion is inside the scored group, so it can
+  // never promote a document the scorer gave 0 over one it could score.
+  return [...diversifyRecords(scored, SIBLING_CAP), ...survivors].slice(0, limit)
 }

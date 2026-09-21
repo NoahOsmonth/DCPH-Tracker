@@ -66,6 +66,35 @@ const conanDoc: CorpusDocument = {
   aliases: ["shinichi"],
 }
 
+/**
+ * One crime record of the villa case, the shape the corpus builder emits: the
+ * case's own title in `metadata.page_title` and the record's index in `title`.
+ */
+function caseRecord(index: number): CorpusDocument {
+  return {
+    id: `case:Mountain Villa Bandaged Man Murder Case#${index}`,
+    source: "dcw_cases",
+    title: `Mountain Villa Bandaged Man Murder Case — case ${index}`,
+    body: "A bandaged man terrorizes the guests at a mountain villa.",
+    url: null,
+    metadata: {
+      page_title: "Mountain Villa Bandaged Man Murder Case",
+      crime_type: "Murder",
+    },
+  }
+}
+
+/** The episode the villa records belong to: the subject of the question. */
+const villaEpisodeDoc: CorpusDocument = {
+  id: "entry:ep-034",
+  source: "content_entries",
+  title: "Mountain Villa Bandaged Man Murder Case (Part 1)",
+  body: "At a mountain villa, a bandaged man terrorizes the guests.",
+  url: "/tracker/ep-034",
+  metadata: { air_date: "1996-10-28" },
+  episodeNumber: 34,
+}
+
 /** A fused candidate with a single fts origin unless a test says otherwise. */
 function fused(
   id: string,
@@ -184,6 +213,58 @@ describe("rankCandidates", () => {
 
     expect(result[0].rrf).toBe(0.03)
     expect([...result[0].origins].sort()).toEqual(["fts", "fuzzy"])
+  })
+
+  it("keeps one case's records from filling the window", () => {
+    // Six records of one case score alike — they share a page title, a crime
+    // type and most of their text — and they all score above the episode they
+    // belong to, whose title carries the extra word "part". Without the cap the
+    // episode is pushed out of the window by its own crime records, which is
+    // what the question was about.
+    const records = [1, 2, 3, 4, 5, 6].map(caseRecord)
+    const docs = [...records, villaEpisodeDoc]
+    const candidates = reciprocalRankFusion([{ source: "fts", ids: docs.map((doc) => doc.id) }])
+
+    const result = rankCandidates(candidates, docs, [
+      "mountain",
+      "villa",
+      "bandaged",
+      "man",
+      "murder",
+      "case",
+    ])
+
+    expect(result.map((entry) => entry.doc.id)).toEqual([
+      "case:Mountain Villa Bandaged Man Murder Case#1",
+      "case:Mountain Villa Bandaged Man Murder Case#2",
+      "entry:ep-034",
+      "case:Mountain Villa Bandaged Man Murder Case#3",
+      "case:Mountain Villa Bandaged Man Murder Case#4",
+      "case:Mountain Villa Bandaged Man Murder Case#5",
+      "case:Mountain Villa Bandaged Man Murder Case#6",
+    ])
+  })
+
+  it("demotes a case's later records rather than dropping them", () => {
+    // The demoted records keep their relative order and stay in the list, so a
+    // question whose answer is in the fourth record still reaches it whenever
+    // the window is long enough.
+    const records = [1, 2, 3, 4].map(caseRecord)
+    const candidates = reciprocalRankFusion([
+      { source: "fts", ids: records.map((doc) => doc.id) },
+    ])
+
+    const result = rankCandidates(candidates, records, ["mountain", "villa", "murder", "case"], {
+      limit: 10,
+    })
+
+    expect(result).toHaveLength(4)
+    expect(result.map((entry) => entry.doc.id)).toEqual([
+      "case:Mountain Villa Bandaged Man Murder Case#1",
+      "case:Mountain Villa Bandaged Man Murder Case#2",
+      "case:Mountain Villa Bandaged Man Murder Case#3",
+      "case:Mountain Villa Bandaged Man Murder Case#4",
+    ])
   })
 
   it("ignores candidate ids the hydration step could not resolve", () => {

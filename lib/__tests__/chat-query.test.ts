@@ -224,30 +224,56 @@ describe("scoreEntry", () => {
   })
 
   it("pays the phrase bonus only for the word order the user asked", () => {
-    // Both orders hit the same two title words; only the asked-for run is a
-    // phrase, so only it earns the full bonus.
+    // Both orders hit the same two title words, so both earn the same coverage
+    // and field scores; the asked-for run is also the title exactly, which is
+    // the only difference left. 8 base + 4 phrase + 5 coverage + 6 exact = 23
+    // against 8 base + 2 all-terms + 5 coverage = 15.
     const asked = scoreEntry({ title: "Heiji Hattori" }, ["heiji", "hattori"])
     const reversed = scoreEntry({ title: "Heiji Hattori" }, ["hattori", "heiji"])
-    expect(asked).toBe(reversed + 2)
+    expect(asked).toBe(23)
+    expect(reversed).toBe(15)
   })
 
   it("pays the phrase bonus once, not twice, when both rules match", () => {
     // "Heiji Hattori" satisfies the contiguous rule and the all-terms rule; the
-    // bonuses are alternatives, so the total is the phrase bonus alone:
-    // title 3 + title 3 + several-keyword 2 + phrase 4 = 12, not 14.
-    expect(scoreEntry({ title: "Heiji Hattori" }, ["heiji", "hattori"])).toBe(12)
+    // bonuses are alternatives, so the phrase contributes 4 and not 4 + 2:
+    // title 3 + title 3 + several-keyword 2 + phrase 4 = 12, not 14. The
+    // coverage and exactness bonuses are separate measures and add on top.
+    expect(scoreEntry({ title: "Heiji Hattori" }, ["heiji", "hattori"])).toBe(23)
   })
 
   it("counts whole words only, so a term inside a longer word does not qualify", () => {
     // "ran" is a substring of "brand" but not a word of it. Neither title holds
-    // the run "ran brand", so the difference is the all-terms bonus alone.
+    // the run "ran brand", so the difference is the all-terms bonus (2) plus
+    // the coverage the buried title loses for a word it never spelled (5/3).
     const buried = scoreEntry({ title: "Brand New Day" }, ["ran", "brand"])
     const spelled = scoreEntry({ title: "Brand Ran Day" }, ["ran", "brand"])
-    expect(spelled - buried).toBe(2)
+    expect(spelled - buried).toBeCloseTo(2 + 5 / 3)
   })
 
-  it("gets the golden miss's order from tokenize, not from a hand-built array", () => {
-    // "Who is Heiji Hattori?" used to arrive as ["hattori", "heiji"], so the
+  it("prefers the document a title names over a record that only carries it", () => {
+    // The measured tie this bonus exists for: "Which movie is The Time-Bombed
+    // Skyscraper?" scored the movie's own entry and the case record beside it
+    // the same, because both titles hold the same words, and fusion order then
+    // decided — against the answer. The record's title carries two words the
+    // question never said, which is what separates them.
+    const keywords = ["movie", "time", "bombed", "skyscraper"]
+    const entry = scoreEntry({ title: "The Time-Bombed Skyscraper" }, keywords)
+    const record = scoreEntry({ title: "The Time-Bombed Skyscraper — case 6" }, keywords)
+    expect(entry).toBeGreaterThan(record)
+  })
+
+  it("pays the exactness bonus when the title is the phrase and nothing else", () => {
+    // "What happens in Moonlight Sonata Murder Case?" — the episode is titled
+    // exactly that, while the 2021 remake's records are titled "The Moonlight
+    // Sonata Murder — case 1" and tie with it on every other term.
+    const keywords = ["moonlight", "sonata", "murder", "case"]
+    const episode = scoreEntry({ title: "Moonlight Sonata Murder Case" }, keywords)
+    const remake = scoreEntry({ title: "The Moonlight Sonata Murder — case 1" }, keywords)
+    expect(episode).toBeGreaterThan(remake)
+  })
+
+  it("gets the golden miss's order from tokenize, not from a hand-built array", () => {    // "Who is Heiji Hattori?" used to arrive as ["hattori", "heiji"], so the
     // character's own title fell to the all-terms bonus while six episodes
     // titled "Hattori Heiji ..." took the phrase one.
     const entry = { title: "Heiji Hattori" }

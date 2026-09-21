@@ -274,6 +274,38 @@ const BONUS_PHRASE_IN_TITLE = 4
  * below all six. It stays weaker than the run because it is a weaker signal.
  */
 const BONUS_ALL_TERMS_IN_TITLE = 2
+/**
+ * The most a title can earn for being made of the words the user asked for.
+ *
+ * A title is the strongest signal the corpus carries, and "how much of it did
+ * the question actually use" is what separates the document *about* a subject
+ * from a document that merely names it. "Which movie is The Time-Bombed
+ * Skyscraper?" uses every meaningful word of that movie's own title, while the
+ * case record beside it is titled "… — case 6": two words the question never
+ * said. Both match the same keywords on the same fields, so they tie, and the
+ * tie was broken by fusion order — which handed the answer to the case record.
+ * Scaled by the covered share, so a title carrying extra words ranks below the
+ * title that is the subject.
+ *
+ * Deliberately below BONUS_EXACT_NUMBER: a question naming an episode number is
+ * a number question first.
+ */
+const BONUS_TITLE_COVERED = 5
+/**
+ * Paid when the title is the phrase and nothing else.
+ *
+ * The strongest form of the signal above: a title that says exactly what the
+ * user asked for, with no word of its own, is the document *about* the subject
+ * rather than one that names it in passing. "What happens in Moonlight Sonata
+ * Murder Case?" is answered by the episode titled exactly that; the 2021
+ * remake's case records are titled "The Moonlight Sonata Murder — case 1" and
+ * tie with it on every other term, so they used to win on fusion order.
+ *
+ * Above BONUS_TITLE_COVERED because it is that measure taken to its limit, and
+ * still below BONUS_EXACT_NUMBER: a question naming an episode number is a
+ * number question first.
+ */
+const BONUS_TITLE_EXACT = 6
 /** An exact episode/movie number beats every keyword match. */
 const BONUS_EXACT_NUMBER = 10
 
@@ -292,6 +324,34 @@ function titleText(entry: RankableEntry): string {
 function allTermsInTitle(title: string, keywords: string[]): boolean {
   const words = new Set(title.split(" "))
   return keywords.every((keyword) => words.has(keyword))
+}
+
+/**
+ * The share of a title's own substance that the keywords account for.
+ *
+ * Grammar is not substance: stopwords and one- or two-letter tokens are dropped
+ * because `tokenize` never emits them, so counting them would penalise a title
+ * for saying "The …" rather than for mentioning something the user did not ask
+ * about. Repetition is kept, not deduplicated — "… — case 2" says "case" twice
+ * and that repeat is exactly the extra word this measure exists to see.
+ */
+function titleCoverage(title: string, keywords: string[]): number {
+  const words = title
+    .split(" ")
+    .filter(
+      (word) =>
+        word.length > 0 &&
+        (word.length >= MIN_KEYWORD_LENGTH || SHORT_TERMS.has(word)) &&
+        !STOPWORDS.has(word)
+    )
+  if (words.length === 0) return 0
+
+  const asked = new Set(keywords)
+  let covered = 0
+  for (const word of words) {
+    if (asked.has(word)) covered += 1
+  }
+  return covered / words.length
 }
 
 /**
@@ -340,6 +400,13 @@ export function scoreEntry(
       score += BONUS_ALL_TERMS_IN_TITLE
     }
   }
+
+  // Independent of the two bonuses above: those read the ORDER of the keywords
+  // in the title, these read how much of the title they cover. A case record
+  // can satisfy neither the run nor the full-term set while still naming the
+  // subject, which is the tie this breaks.
+  score += BONUS_TITLE_COVERED * titleCoverage(title, keywords)
+  if (title.length > 0 && title === phrase) score += BONUS_TITLE_EXACT
 
   for (const n of numbers) {
     if (entry.episode_number === n || entry.movie_number === n) {

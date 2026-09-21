@@ -30,6 +30,9 @@ yarn-error.log*
 
 # env files
 .env*.local
+# A copy of the same file without the leading dot holds the same secrets and
+# matches none of the patterns above.
+env.local
 
 # vercel
 .vercel

@@ -75,6 +75,7 @@ logs/
 
 # supabase CLI state
 supabase/.temp/
+supabase/.branches/
 
 # curation backups
 /scripts/out/

@@ -1,6 +1,8 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  // stagepreview: emit a self-contained server bundle for the Docker image.
+  output: "standalone",
   images: {
     /*
       Quota guardrails for the Vercel image optimizer (Hobby = 5,000

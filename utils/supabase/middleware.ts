@@ -2,7 +2,7 @@ import "server-only"
 import { createServerClient } from "@supabase/ssr"
 import { type NextRequest, NextResponse } from "next/server"
 import type { Database } from "@/types/database.types"
-import { SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY } from "@/lib/env"
+import { IS_HTTPS_DEPLOYMENT, SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY } from "@/lib/env"
 import { applySecurityHeaders, copyCookies } from "@/lib/security-headers"
 import { REQUEST_TIMEOUT_MS, withTimeout } from "@/lib/request-timeout"
 
@@ -69,7 +69,7 @@ export async function updateSession(
           // if that CSP is ever removed, this cookie becomes XSS-readable
           // with no mitigation.
           const hardened = {
-            secure: isProd,
+            secure: isProd && IS_HTTPS_DEPLOYMENT,
             sameSite: "lax" as const, // 'strict' breaks OAuth/magic-link callbacks
             path: "/",
           }
@@ -198,7 +198,7 @@ export async function updateSession(
             response.cookies.set(cookie.name, "", {
               path: "/",
               maxAge: 0,
-              secure: isProd,
+              secure: isProd && IS_HTTPS_DEPLOYMENT,
               sameSite: "lax",
             })
           }

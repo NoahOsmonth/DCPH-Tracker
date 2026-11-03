@@ -18,6 +18,15 @@ export const SUPABASE_PUBLISHABLE_KEY = required(
   "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY"
 )
 
+/** Canonical public URL of this deployment (inlined at build time). */
+export const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL ?? ""
+
+/**
+ * Whether the app is served over TLS. Browsers drop `Secure` cookies on plain
+ * http, so an http staging/preview deployment must not set that flag.
+ */
+export const IS_HTTPS_DEPLOYMENT = SITE_URL.startsWith("https://")
+
 /** Host of the Supabase project, used to build CSP allowlists. */
 export const SUPABASE_HOST = (() => {
   try {

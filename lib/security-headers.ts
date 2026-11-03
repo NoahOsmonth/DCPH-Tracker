@@ -1,5 +1,5 @@
 import type { NextResponse } from "next/server"
-import { SUPABASE_HOST } from "./env"
+import { IS_HTTPS_DEPLOYMENT, SUPABASE_HOST } from "./env"
 
 /**
  * Builds a nonce-based Content-Security-Policy.
@@ -36,7 +36,9 @@ export function buildCsp(nonce: string): string {
     `frame-ancestors 'none'`,
   ]
 
-  if (!isDev) directives.push("upgrade-insecure-requests")
+  // Only meaningful over TLS: on a plain-http deployment it rewrites every
+  // subresource URL to https:// and the page loads without CSS/JS (staging).
+  if (!isDev && IS_HTTPS_DEPLOYMENT) directives.push("upgrade-insecure-requests")
 
   return directives
     .map((d) => d.replace(/\s{2,}/g, " ").trim())

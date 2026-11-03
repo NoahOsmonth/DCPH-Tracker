@@ -2,7 +2,7 @@ import "server-only"
 import { createServerClient } from "@supabase/ssr"
 import { cookies } from "next/headers"
 import type { Database } from "@/types/database.types"
-import { SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY } from "@/lib/env"
+import { IS_HTTPS_DEPLOYMENT, SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY } from "@/lib/env"
 
 const isProd = process.env.NODE_ENV === "production"
 
@@ -26,7 +26,7 @@ export const createClient = async () => {
           cookiesToSet.forEach(({ name, value, options }) =>
             cookieStore.set(name, value, {
               ...options,
-              secure: isProd,
+              secure: isProd && IS_HTTPS_DEPLOYMENT,
               sameSite: "lax",
               path: "/",
             })
